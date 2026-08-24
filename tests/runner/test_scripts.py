@@ -22,6 +22,14 @@ from hermes_claude_runner import config
 # nobody's namespace, so the needles only have to have the right shape.
 INVENTED_LABEL = "com.example.legacy-runner"
 
+# A bootstrap that keeps failing however long the installer is willing to wait.
+BOOTSTRAP_NEVER_SETTLES = 10**6
+
+# The slowest teardown seen on a real Mac released the label only in time for
+# the sixth bootstrap. The installer has to clear that rung *and* keep attempts
+# behind it, or the next machine that is a little slower has no reserve left.
+OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT = 6
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "scripts"
 NAMES = ("install_runner.sh", "install_plugin_on_surface.sh", "uninstall.sh")
@@ -109,8 +117,15 @@ def test_surface_installer_keeps_the_remote_tilde_for_the_remote_shell() -> None
 
 # ── the installer, actually executed ───────────────────────────────────────
 
-def _sandbox(tmp_path: Path, *, health_fails: bool = False) -> tuple[dict[str, str], Path]:
-    """A PATH of recording stubs plus a throwaway HOME."""
+def _sandbox(
+    tmp_path: Path, *, health_fails: bool = False, bootstrap_failures: int = 0,
+) -> tuple[dict[str, str], Path]:
+    """A PATH of recording stubs plus a throwaway HOME.
+
+    ``bootstrap_failures`` makes that many leading ``launchctl bootstrap``
+    calls fail the way a teardown that has not settled yet does, so a race
+    the installer has to survive can be replayed without a real launchd.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "calls.log"
@@ -125,8 +140,19 @@ def _sandbox(tmp_path: Path, *, health_fails: bool = False) -> tuple[dict[str, s
         "esac\n"
         "exit 0\n"
     )
+    # launchd answers a bootstrap that lands on a label the previous service
+    # has not finished releasing with exit 5, on stderr, in these words.
     (bin_dir / "launchctl").write_text(
-        f'#!/bin/sh\nprintf "launchctl %s\\n" "$*" >> {log}\nexit 0\n'
+        "#!/bin/sh\n"
+        f'printf "launchctl %s\\n" "$*" >> {shlex.quote(str(log))}\n'
+        'if [ "$1" = bootstrap ]; then\n'
+        f'  tries=$(grep -c "^launchctl bootstrap" {shlex.quote(str(log))})\n'
+        f'  if [ "$tries" -le {bootstrap_failures} ]; then\n'
+        "    printf 'Bootstrap failed: 5: Input/output error\\n' >&2\n"
+        "    exit 5\n"
+        "  fi\n"
+        "fi\n"
+        "exit 0\n"
     )
     for stub in ("uv", "launchctl"):
         (bin_dir / stub).chmod(0o755)
@@ -266,6 +292,92 @@ def test_installer_refuses_to_claim_success_when_the_wrapper_names_the_checkout(
     assert payload["health"]["ok"] is True, "the daemon answered; this is not a health failure"
     assert payload["ok"] is False
     assert completed.returncode != 0
+
+
+def _launchctl_calls(log: Path) -> list[str]:
+    return [line for line in log.read_text().splitlines() if line.startswith("launchctl ")]
+
+
+def test_installer_retries_a_bootstrap_that_races_the_teardown(tmp_path: Path) -> None:
+    """`launchctl bootout` returns before the label leaves the domain.
+
+    Caught upgrading a healthy service on a real Mac: a valid plist, booted
+    out and bootstrapped in the next breath, failed with exit 5
+    (`Input/output error`), and the identical bootstrap succeeded once the
+    teardown had settled.
+    """
+    env, log = _sandbox(tmp_path, bootstrap_failures=2)
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)   # still exactly one object
+    assert payload["ok"] is True
+
+    calls = _launchctl_calls(log)
+    attempts = [i for i, line in enumerate(calls) if line.startswith("launchctl bootstrap")]
+    assert len(attempts) == 3, calls
+
+    # The retry waits for the domain; it must not reorder the install around it.
+    bootout = next(i for i, line in enumerate(calls) if line.startswith("launchctl bootout"))
+    kickstart = next(i for i, line in enumerate(calls) if line.startswith("launchctl kickstart"))
+    assert bootout < attempts[0], calls
+    assert kickstart > attempts[-1], calls
+
+
+def test_installer_survives_the_slowest_teardown_seen_on_a_real_mac(tmp_path: Path) -> None:
+    """The smoke that failed five attempts and loaded on the sixth.
+
+    Pinned by attempt number rather than by seconds: the schedule may be
+    stretched, but the machine that needed six bootstraps has to keep
+    installing.
+    """
+    env, log = _sandbox(
+        tmp_path, bootstrap_failures=OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT - 1,
+    )
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)   # still exactly one object
+    assert payload["ok"] is True
+    assert payload["health"]["ok"] is True
+
+    calls = _launchctl_calls(log)
+    attempts = [i for i, line in enumerate(calls) if line.startswith("launchctl bootstrap")]
+    assert len(attempts) == OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT, calls
+    kickstart = next(i for i, line in enumerate(calls) if line.startswith("launchctl kickstart"))
+    assert kickstart > attempts[-1], "the service that finally loaded must still be kickstarted"
+
+
+def test_installer_keeps_a_bootstrap_that_never_settles_fatal(tmp_path: Path) -> None:
+    """Retrying must not turn a service that never loaded into a quiet success."""
+    env, log = _sandbox(tmp_path, bootstrap_failures=BOOTSTRAP_NEVER_SETTLES)
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    assert completed.returncode != 0
+    payload = json.loads(completed.stdout)   # still exactly one object
+    # The health probe answers; only the bootstrap failed, and the verdict
+    # has to come from there rather than from a coincidentally silent daemon.
+    assert payload["health"]["ok"] is True
+    assert payload["ok"] is False
+
+    calls = _launchctl_calls(log)
+    attempts = sum(line.startswith("launchctl bootstrap") for line in calls)
+    assert attempts > OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT, (
+        "a schedule that gives up on the slowest teardown already observed "
+        "keeps no reserve for the machine that is a little slower"
+    )
+    assert not any(line.startswith("launchctl kickstart") for line in calls), (
+        "kickstarting a service that was never bootstrapped hides the real failure"
+    )
+
+    # The operator has to be told how hard it tried and what launchd answered;
+    # the count is checked against the calls so the message cannot drift.
+    said = re.search(
+        r"bootstrap never succeeded: (\d+) attempts, last exit (\d+)", completed.stderr,
+    )
+    assert said, completed.stderr
+    assert int(said.group(1)) == attempts
+    assert said.group(2) == "5", "the exit code the operator has to act on"
 
 
 def test_installer_rejects_an_unknown_flag(tmp_path: Path) -> None:

@@ -75,8 +75,51 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
     say "==> (Re)loading the LaunchAgent $LABEL"
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+
+    # bootout returns once the teardown has been *requested*, not once it has
+    # finished. Until the old job releases the label, a bootstrap of a plist
+    # that is perfectly valid fails with exit 5, "Input/output error", and the
+    # very same command succeeds a moment later. So the bootstrap is its own
+    # readiness probe: retry it rather than guess at a settling time.
+    #
+    # The first attempt is immediate, so a machine with nothing to wait for
+    # waits for nothing. The slowest teardown seen on a real Mac released the
+    # label only in time for the sixth attempt, 7.7 s in, which is why the
+    # ladder keeps going afterwards: a schedule that ends on the slowest case
+    # already observed has no reserve for the machine that is a little slower.
+    # The backoff stops doubling at 4 s because a longer gap only postpones the
+    # verdict, it does not make a stuck teardown more likely to finish; steady
+    # 4 s probes catch a late release sooner for the same budget. Eight
+    # attempts, at most 15.7 s of waiting — roughly twice the slowest teardown
+    # observed. Past that a service is not slow, it is broken, and saying so
+    # beats waiting longer. launchctl's stdout is folded into stderr because in
+    # --json mode stdout carries exactly one object.
+    BOOTSTRAPPED=0
+    BOOTSTRAP_TRIES=0
+    BOOTSTRAP_STATUS=0
+    for delay in 0 0.2 0.5 1 2 4 4 4; do
+        [ "$delay" = 0 ] || sleep "$delay"
+        BOOTSTRAP_TRIES=$((BOOTSTRAP_TRIES + 1))
+        BOOTSTRAP_STATUS=0
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" >&2 || BOOTSTRAP_STATUS=$?
+        if [ "$BOOTSTRAP_STATUS" -eq 0 ]; then
+            BOOTSTRAPPED=1
+            break
+        fi
+        say "    launchctl bootstrap exited $BOOTSTRAP_STATUS on attempt $BOOTSTRAP_TRIES; the previous service may still be releasing the label"
+    done
+
+    if [ "$BOOTSTRAPPED" -eq 1 ]; then
+        launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    else
+        # Kickstarting a label that was never bootstrapped would report a
+        # second, derived failure over the real one. Recorded in the verdict
+        # rather than exited on here, so --json still prints exactly one
+        # object; the exit status at the end of this script is what makes it
+        # fatal.
+        say "    launchctl bootstrap never succeeded: $BOOTSTRAP_TRIES attempts, last exit $BOOTSTRAP_STATUS"
+        OK=false
+    fi
 
     say "==> Waiting for the daemon"
     i=0

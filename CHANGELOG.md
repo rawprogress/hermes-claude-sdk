@@ -6,7 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- `doctor` now proves Claude Code is usable rather than merely present. `claude_cli`
+  resolves the binary, requires it to be an executable file, and makes it report its
+  version. Two new required checks join it: `claude_auth`, which asks
+  `claude auth status --json` whether a session exists, and `agent_sdk`, which compares
+  the importable `claude-agent-sdk` against the version `pyproject.toml` pins. Each
+  carries a machine-readable `state` from a declared vocabulary, and an exact fix.
+- A machine with no signed-in session reports `installable: false`. Installing cannot sign
+  anybody in, so offering it as the fix would walk an installing agent past the one step
+  that needs a human. `INSTALL_FOR_AGENTS.md` maps both new checks and their states.
+- The preflight always emits one machine-readable report. Output that is not UTF-8, JSON
+  nested past the recursion limit, and a binary that cannot be spawned each produce a
+  verdict rather than a traceback.
+- Probe output is captured with a bound in memory and still read to completion, so a CLI
+  that prints megabytes is neither buffered in full nor mistaken for one that hung. Both
+  probes remain bounded by a timeout.
+
+- The secret scrubber is linear. Both its assignment scan and the doctor's
+  address scan opened with an unbounded run of name characters, which made the
+  regex engine walk that run and back at every position: 64 KiB of `a.` cost
+  200 seconds and 6.8 seconds respectively, on text a CLI controls. Both now
+  anchor on the one token that has to be there — the credential word, the `@` —
+  and walk outwards. Nothing about what counts as a secret changed.
+
+### Security
+
+- No part of the auth payload reaches a report, on any path. Only `loggedIn` and the
+  non-identifying mode fields are read: the account's address and organisation stay inside
+  the CLI, and a non-zero exit is classified rather than quoted back.
+- Everything the CLI does supply is redacted before it is truncated, and bounded per field
+  as well as per line, so no output the doctor did not expect can grow a report or carry a
+  credential into one.
 
 ## [0.2.0] - 2026-08-24
 

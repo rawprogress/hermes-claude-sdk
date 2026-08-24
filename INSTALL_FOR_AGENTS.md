@@ -69,12 +69,25 @@ with a `fix` string carrying the exact command. Map them:
 | `python` | Python older than 3.12 | `uv python install 3.12`, then re-run |
 | `uv` | uv missing | **Blocks.** Every command here is `uv run …`, and the installer runs `uv sync`. Install it: <https://docs.astral.sh/uv/> |
 | `git` | git missing | `xcode-select --install` — needs a human to click through |
-| `claude_cli` | Claude Code missing or not signed in | **STOP** — see step 2 |
+| `agent_sdk` | `claude-agent-sdk` is not importable, or older than the version `pyproject.toml` pins | `uv sync` in the checkout, then re-run |
+| `claude_cli` | Claude Code is missing, is not an executable file, or cannot report a version | **STOP** — see step 2 |
+| `claude_auth` | Claude Code runs but reports no signed-in session, or is too old to answer `claude auth status --json` | **STOP** — see step 2. Only a human can sign in; no installer can. |
 | `projects_root` | The projects root does not exist | Ask the human where their code lives; set `HERMES_CLAUDE_RUNNER_PROJECTS_ROOT` |
 | `daemon`, `launch_agent`, `wrapper` | Not installed yet | Expected on a first install. These are what `installable` allows. |
 
 `database` and `node` are the only non-required checks. Node is an implementation detail of
-some Claude Code installs and absent from others; `claude_cli` is the check that matters.
+some Claude Code installs and absent from others; `claude_cli` and `claude_auth` are the
+checks that matter.
+
+`agent_sdk`, `claude_cli` and `claude_auth` each carry a `state` field alongside `ok`, so
+you can branch on a value instead of reading prose:
+
+- `claude_cli`: `ready`, `missing`, `not_executable`, `timeout`, `failed`, `unrecognized`
+- `claude_auth`: `signed_in`, `logged_out`, `timeout`, `incompatible`, `unverifiable`
+- `agent_sdk`: `ready`, `missing`, `too_old`, `unrecognized`
+
+A signed-out machine is **not** `installable`, however complete the rest of it is. That is
+deliberate: installing cannot sign anybody in.
 
 ---
 
@@ -83,16 +96,20 @@ some Claude Code installs and absent from others; `claude_cli` is the check that
 The runner drives the Mac's existing Claude Code installation and its OAuth session. It
 never handles credentials.
 
-**You must stop here if `doctor` reported `claude_cli` as failing, or if you cannot confirm
-a signed-in session.** Ask the human to:
+**You must stop here if `doctor` reported `claude_cli` or `claude_auth` as failing.**
+`claude_auth` with `state: "logged_out"` is exactly this step and nothing else; with
+`state: "incompatible"` the install is too old to be asked, and needs `claude update`
+first. Ask the human to:
 
 1. Install Claude Code from <https://claude.com/claude-code>.
 2. Run `claude` once and complete the browser sign-in.
 
-You may verify afterwards with a read-only command:
+You may verify afterwards with read-only commands — the same two the doctor runs, and the
+only two it will ever run:
 
 ```sh
 command -v claude && claude --version
+claude auth status --json
 ```
 
 Do not attempt the login yourself. Do not read any file under `~/.claude/` looking for a

@@ -37,14 +37,65 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 ) + _HEURISTIC
 
 # ``NAME=value`` / ``name: value`` where NAME looks like a credential.
-_SECRET_NAME = (
-    r"[A-Za-z0-9_.\-]*"
-    r"(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|CREDENTIAL|PRIVATE_KEY)"
-    r"[A-Za-z0-9_.\-]*"
+#
+# Anchored on the word, not on the name. The obvious pattern puts an
+# unbounded ``[A-Za-z0-9_.-]*`` in front of the word, which makes the engine
+# walk the whole name run and back at every starting position: quadratic, and
+# measured at 111 seconds for 64 KiB of ``a.``. That is not a hypothetical
+# input — the doctor hands this function whatever a CLI printed, and a
+# process timeout cannot help with a cost paid after the process has exited.
+_SECRET_WORDS = (
+    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY",
+    "ACCESS_KEY", "CREDENTIAL", "PRIVATE_KEY",
 )
-_ASSIGNMENT = re.compile(
-    rf"(?i)\b({_SECRET_NAME})(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;)}}\]]+)"
+_SECRET_WORD = re.compile("|".join(_SECRET_WORDS), re.IGNORECASE)
+
+#: What a credential's name may be built from, around the word above.
+_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
 )
+
+#: ``= value``, ``: "value"`` — matched where the name ends, never searched
+#: for, so there is no starting position for the engine to reconsider.
+_ASSIGNED_VALUE = re.compile(r"\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;)}\]]+)")
+
+
+def _redact_assignments(value: str) -> str:
+    """Replace the value of every ``NAME=value`` whose NAME reads as a secret.
+
+    Linear by construction: find the credential word, which is one of a fixed
+    set of literals, then walk outwards over the name characters beside it.
+    Nothing asks a regex engine to guess where a name of unbounded length
+    began.
+
+    ``run_end`` is load-bearing rather than an optimisation. Every word inside
+    one run of name characters expands to the same place, so without it a run
+    like ``TOKEN`` repeated with no ``=`` after it is walked once per word,
+    and the quadratic cost comes straight back.
+
+    The name and the separator survive verbatim; only the value goes, so a
+    reader can still see which setting was scrubbed.
+    """
+    pieces: list[str] = []
+    cursor = 0    # everything before this is already decided
+    run_end = 0   # end of the last name run walked, hit or miss
+    for word in _SECRET_WORD.finditer(value):
+        if word.start() < max(cursor, run_end):
+            continue
+        end = word.end()
+        while end < len(value) and value[end] in _NAME_CHARS:
+            end += 1
+        run_end = end
+        assignment = _ASSIGNED_VALUE.match(value, end)
+        if assignment is None:
+            continue
+        pieces.append(value[cursor:assignment.start(1)])
+        pieces.append("[redacted:secret]")
+        cursor = assignment.end(1)
+    if not pieces:
+        return value
+    pieces.append(value[cursor:])
+    return "".join(pieces)
 
 
 def redact_text(value: str) -> str:
@@ -54,8 +105,7 @@ def redact_text(value: str) -> str:
     out = value
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
-    out = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted:secret]", out)
-    return out
+    return _redact_assignments(out)
 
 
 def find_secrets(value: str) -> list[str]:

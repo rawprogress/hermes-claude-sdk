@@ -1,6 +1,6 @@
 name: hermes-claude-sdk
 version: 0.2.0
-description: "Drive Claude Code on the Mac from Hermes. Seven tools start, steer, inspect, stop and resume Claude Agent SDK runs over ssh; Claude does the coding, tests, lint, typecheck, build and reviews."
+description: "Drive Claude Code on the Mac from Hermes. Seven tools start, steer, inspect, stop and resume Claude Agent SDK runs over ssh, or on this machine when transport is local; Claude does the coding, tests, lint, typecheck, build and reviews."
 author: Katso & rawprogress
 kind: standalone
 manifest_version: 2
@@ -20,20 +20,36 @@ provides_tools:
   - claude_resume
 python_dependencies: []
 config_schema:
+  transport:
+    type: string
+    default: ssh
+    description: >-
+      How Hermes reaches the runner: 'ssh' for a Mac on the network, or
+      'local' when Hermes runs on that same Mac. Anything else falls back to
+      'ssh'.
   ssh_host:
     type: string
     default: macbook
-    description: "ssh destination of the Mac running hermes-claude-runner."
+    description: "ssh destination of the Mac running hermes-claude-runner. Used by transport: ssh."
   remote_command:
     type: string
     default: ~/.local/bin/hermes-claude-runner
     description: >-
       The runner wrapper on the Mac; 'rpc' is appended. Either home-relative
-      (~/...), which the Mac's login shell expands, or an absolute path.
+      (~/...), which the Mac's login shell expands, or an absolute path. Used
+      by transport: ssh.
+  local_command:
+    type: string
+    default: ~/.local/bin/hermes-claude-runner
+    description: >-
+      The runner wrapper on this machine; 'rpc' is appended. Either
+      home-relative (~/...), which the plugin expands itself because no shell
+      is involved, or an absolute path. Used by transport: local.
   timeout_seconds:
     type: integer
     default: 240
     description: >-
-      Seconds to wait for one ssh round trip before failing. Values below 240
-      are raised to that floor: the runner creates the git worktree inline, so
-      a shorter wait would report ssh_timeout for a run that really started.
+      Seconds to wait for one round trip before failing, on either transport.
+      Values below 240 are raised to that floor: the runner creates the git
+      worktree inline, so a shorter wait would report a timeout for a run that
+      really started.

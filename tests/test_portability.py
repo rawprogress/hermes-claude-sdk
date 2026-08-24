@@ -231,6 +231,100 @@ def test_a_fresh_account_gets_a_complete_working_installation(tmp_path: Path) ->
     assert str(paths.wrapper_path).startswith(str(home))
 
 
+def doctor_mapping_table() -> str:
+    """The `Failing check | Meaning | Action` table in the agent guide."""
+    rows = [line for line in read(AGENT_GUIDE).splitlines() if line.startswith("| `")]
+    assert rows, "the failing-check mapping table has moved or gone"
+    return "\n".join(rows)
+
+
+def hermetic_report(tmp_path: Path, monkeypatch) -> dict:
+    """A doctor verdict for a machine with no Claude Code and no daemon.
+
+    No probe spawns: with nothing on PATH and nothing at the configured path
+    the CLI check short-circuits, so this stays a pure inspection of the
+    check list — and never touches the caller's own installation.
+    """
+    from hermes_claude_runner import config, doctor
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(doctor, "_spawn", lambda *a, **k: pytest.fail(  # noqa: SLF001
+        "the parity gate must not run a binary"))
+    paths = config.paths_from_env({}, home=tmp_path / "home")
+    return doctor.diagnose(paths, probe_daemon=False)
+
+
+def test_every_required_check_is_mapped_for_the_installing_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A check that can block an install and is not in the table is a dead end.
+
+    The guide tells an agent to read `report.problems` and map each name. A
+    name the table does not carry leaves it with a blocker and no branch.
+    """
+    report = hermetic_report(tmp_path, monkeypatch)
+    table = doctor_mapping_table()
+
+    unmapped = [
+        entry["name"] for entry in report["checks"]
+        if entry["required"] and f"`{entry['name']}`" not in table
+    ]
+    assert unmapped == [], (
+        f"{AGENT_GUIDE.name} does not tell an agent what to do about: {unmapped}"
+    )
+
+
+def test_the_guide_names_the_session_check_where_it_stops(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A logged-out machine fails `claude_auth` while `claude_cli` passes.
+
+    The STOP in step 2 used to key off `claude_cli` alone, which no longer
+    covers the case it exists for.
+    """
+    guide = read(AGENT_GUIDE)
+    stop = guide.split("## 2. STOP")[1].split("---")[0]
+    assert "claude_auth" in stop, "the sign-in STOP does not name the check that reports it"
+
+    report = hermetic_report(tmp_path, monkeypatch)
+    assert "claude_auth" in [c["name"] for c in report["checks"] if c["required"]]
+
+
+def test_the_guide_lists_the_states_the_code_can_report() -> None:
+    """An agent told to branch on `state` needs the whole vocabulary.
+
+    A value the guide omits is a branch the agent has no plan for, and the
+    lists drift silently: nothing else compares them.
+    """
+    from hermes_claude_runner import doctor
+
+    guide = read(AGENT_GUIDE)
+    for check_name, states in (
+        ("claude_cli", doctor.CLAUDE_CLI_STATES),
+        ("claude_auth", doctor.CLAUDE_AUTH_STATES),
+        ("agent_sdk", doctor.AGENT_SDK_STATES),
+    ):
+        line = next(
+            (row for row in guide.splitlines()
+             if row.startswith(f"- `{check_name}`:")),
+            None,
+        )
+        assert line, f"{AGENT_GUIDE.name} lists no states for {check_name}"
+        listed = set(re.findall(r"`([a-z_]+)`", line)) - {check_name}
+        assert listed == set(states), (
+            f"{check_name}: guide lists {sorted(listed)}, code reports {sorted(states)}"
+        )
+
+
+def test_the_changelog_records_the_preflight_change() -> None:
+    """An unreleased behaviour change an installing agent can see must be written down."""
+    unreleased = read(REPO_ROOT / "CHANGELOG.md").split("## [Unreleased]")[1]
+    unreleased = unreleased.split("## [0.2.0]")[0]
+    assert "Nothing yet." not in unreleased
+    for name in ("claude_auth", "agent_sdk"):
+        assert name in unreleased, f"{name} is a new verdict and is not in the changelog"
+
+
 def test_the_doctor_knows_the_real_python_floor() -> None:
     """One declared minimum. A doctor that invents its own would lie to an agent."""
     declared = re.search(r'requires-python = ">=([\d.]+)"', read(REPO_ROOT / "pyproject.toml"))

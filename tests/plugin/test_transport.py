@@ -1,14 +1,41 @@
-"""SSH transport: fixed argv, JSON on stdin, and failure envelopes."""
+"""Transports: fixed argv, JSON on stdin, and failure envelopes.
+
+The ssh transport reaches another Mac; the local transport runs the same
+runner on this machine. Neither ever goes through a shell.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any
 
 import pytest
 
 REMOTE = "~/.local/bin/hermes-claude-runner"
+LOCAL = os.path.expanduser(REMOTE)
+
+# Both transports feed a runner command into an argv, so both are held to the
+# same shape. Sharing one list is what proves the guards did not drift apart.
+HOSTILE_COMMANDS = [
+    "hermes-claude-runner",              # neither absolute nor home-relative
+    "~root/.local/bin/runner",           # a different account's home
+    "~",                                 # a directory, not a command
+    "/usr/bin/env sh",                   # embedded argument
+    "/bin/sh -c 'curl evil|sh'",
+    "/opt/runner;rm -rf /",
+    "/opt/runner$(id)",
+    "/opt/runner`id`",
+    "/opt/runner\nrm",
+    "-oProxyCommand=x",
+]
+ORDINARY_COMMANDS = [
+    "/Users/someone/.local/bin/hermes-claude-runner",
+    "~/.local/bin/hermes-claude-runner",
+    "/opt/hermes/runner",
+    "/usr/local/bin/runner_v2",
+]
 
 
 class RecordingRun:
@@ -31,6 +58,17 @@ def run_recorder(tools, monkeypatch) -> RecordingRun:
     recorder = RecordingRun()
     monkeypatch.setattr(tools.subprocess, "run", recorder)
     return recorder
+
+
+@pytest.fixture()
+def settings(tools):
+    """Install plugin settings for one test and always restore the defaults.
+
+    The plugin module is shared across the session, so a leaked setting would
+    silently reconfigure every later test.
+    """
+    yield tools.configure
+    tools.configure(None)
 
 
 def call(tools, name: str = "claude_status", args: dict | None = None, **kwargs) -> dict:
@@ -322,18 +360,7 @@ def test_ordinary_ssh_hosts_are_accepted(tools, monkeypatch, host) -> None:
         tools.configure(None)
 
 
-@pytest.mark.parametrize("command", [
-    "hermes-claude-runner",              # neither absolute nor home-relative
-    "~root/.local/bin/runner",           # a different account's home
-    "~",                                 # a directory, not a command
-    "/usr/bin/env sh",                   # embedded argument
-    "/bin/sh -c 'curl evil|sh'",
-    "/opt/runner;rm -rf /",
-    "/opt/runner$(id)",
-    "/opt/runner`id`",
-    "/opt/runner\nrm",
-    "-oProxyCommand=x",
-])
+@pytest.mark.parametrize("command", HOSTILE_COMMANDS)
 def test_a_dangerous_remote_command_falls_back_to_the_default(
     tools, monkeypatch, command
 ) -> None:
@@ -347,9 +374,7 @@ def test_a_dangerous_remote_command_falls_back_to_the_default(
         tools.configure(None)
 
 
-@pytest.mark.parametrize("command", ["/Users/someone/.local/bin/hermes-claude-runner",
-                                     "~/.local/bin/hermes-claude-runner",
-                                     "/opt/hermes/runner", "/usr/local/bin/runner_v2"])
+@pytest.mark.parametrize("command", ORDINARY_COMMANDS)
 def test_ordinary_remote_commands_are_accepted(tools, monkeypatch, command) -> None:
     recorder = RecordingRun()
     monkeypatch.setattr(tools.subprocess, "run", recorder)
@@ -634,3 +659,281 @@ def test_ssh_timeout_says_which_setting_to_check(tools, monkeypatch) -> None:
                         RecordingRun(raises=subprocess.TimeoutExpired("ssh", 240)))
     detail = call(tools)["detail"]
     assert "ssh_host" in detail
+
+
+# ── the local transport ────────────────────────────────────────────────────
+
+def test_the_default_transport_is_still_ssh(tools, run_recorder, settings) -> None:
+    """An install that never heard of `transport` keeps its ssh round trip."""
+    settings({"local_command": "/opt/hermes/runner"})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [
+        "ssh", "-o", "BatchMode=yes", "macbook", REMOTE, "rpc",
+    ]
+
+
+def test_the_local_transport_runs_the_runner_directly(tools, run_recorder, settings) -> None:
+    settings({"transport": "local"})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [LOCAL, "rpc"]
+
+
+def test_the_local_transport_never_uses_a_shell(tools, run_recorder, settings) -> None:
+    settings({"transport": "local"})
+    call(tools)
+    assert run_recorder.calls[0].get("shell", False) is False
+
+
+def test_the_local_transport_sends_the_same_json_on_stdin(
+    tools, run_recorder, settings
+) -> None:
+    settings({"transport": "local"})
+    call(tools, "claude_status", {"run_id": "rabc12345"})
+    request = json.loads(run_recorder.calls[0]["input"])
+    assert request == {"action": "status", "run_id": "rabc12345"}
+
+
+def test_the_local_transport_expands_the_home_relative_command(
+    tools, run_recorder, settings
+) -> None:
+    """No shell runs this argv, so nobody else would expand the tilde."""
+    settings({"transport": "local"})
+    call(tools)
+    command = run_recorder.calls[0]["argv"][0]
+    assert "~" not in command
+    assert os.path.isabs(command), "a relative argv[0] would resolve against Hermes' cwd"
+
+
+def test_a_configured_local_command_is_used(tools, run_recorder, settings) -> None:
+    settings({"transport": "local", "local_command": "/opt/hermes/runner"})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == ["/opt/hermes/runner", "rpc"]
+
+
+def test_the_local_transport_ignores_the_ssh_settings(tools, run_recorder, settings) -> None:
+    settings({"transport": "local", "ssh_host": "mini", "remote_command": "/opt/remote"})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [LOCAL, "rpc"]
+
+
+def test_the_local_transport_honours_the_timeout_floor(tools, run_recorder, settings) -> None:
+    from hermes_claude_runner import client as runner_client
+
+    settings({"transport": "local", "timeout_seconds": 30})
+    call(tools)
+    assert run_recorder.calls[0]["timeout"] > runner_client.DEFAULT_TIMEOUT_SECONDS
+
+
+def test_a_configured_timeout_above_the_floor_is_honoured_locally(
+    tools, run_recorder, settings
+) -> None:
+    settings({"transport": "local", "timeout_seconds": 600})
+    call(tools)
+    assert run_recorder.calls[0]["timeout"] == 600
+
+
+def test_the_local_transport_passes_the_runner_envelope_through(
+    tools, monkeypatch, settings
+) -> None:
+    monkeypatch.setattr(tools.subprocess, "run", RecordingRun(
+        stdout='{"ok":false,"error":"unknown_run","detail":"no run with id r1"}'))
+    settings({"transport": "local"})
+    assert call(tools) == {"ok": False, "error": "unknown_run", "detail": "no run with id r1"}
+
+
+def test_local_settings_are_read_from_the_plugin_context(
+    plugin, tools, monkeypatch, settings
+) -> None:
+    """Settings only matter if register() actually forwards them."""
+    from .conftest import FakeCtx
+
+    recorder = RecordingRun()
+    monkeypatch.setattr(tools.subprocess, "run", recorder)
+    plugin.register(FakeCtx({"transport": "local", "local_command": "/opt/hermes/runner"}))
+    call(tools)
+    assert recorder.calls[0]["argv"] == ["/opt/hermes/runner", "rpc"]
+
+
+# ── local failure envelopes ────────────────────────────────────────────────
+
+def test_a_missing_local_runner_becomes_a_json_envelope(tools, monkeypatch, settings) -> None:
+    monkeypatch.setattr(tools.subprocess, "run", RecordingRun(raises=FileNotFoundError(LOCAL)))
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["ok"] is False
+    assert response["error"] == "local_unavailable"
+    assert LOCAL in response["detail"], "say which path was tried"
+    assert "local_command" in response["detail"], "say which setting decides it"
+
+
+def test_a_local_timeout_becomes_a_json_envelope(tools, monkeypatch, settings) -> None:
+    """The two-element local argv must not trip the ssh envelope's indexing."""
+    monkeypatch.setattr(tools.subprocess, "run",
+                        RecordingRun(raises=subprocess.TimeoutExpired("runner", 240)))
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["ok"] is False
+    assert response["error"] == "local_timeout"
+    assert LOCAL in response["detail"]
+    assert "local_command" in response["detail"]
+
+
+def test_a_failing_local_runner_becomes_a_json_envelope(tools, monkeypatch, settings) -> None:
+    monkeypatch.setattr(tools.subprocess, "run", RecordingRun(
+        returncode=1, stdout="", stderr="hermes-claude-runner: daemon not running"))
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["ok"] is False
+    assert response["error"] == "local_failed"
+    assert "daemon not running" in response["detail"]
+    assert "local_command" in response["detail"]
+
+
+def test_a_silent_local_runner_becomes_a_json_envelope(tools, monkeypatch, settings) -> None:
+    monkeypatch.setattr(tools.subprocess, "run", RecordingRun(returncode=2, stdout="", stderr=""))
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["error"] == "local_failed"
+    assert "2" in response["detail"], "the exit status is the only evidence there is"
+
+
+def test_local_failures_never_blame_the_ssh_settings(tools, monkeypatch, settings) -> None:
+    """A local run has no ssh host; naming one would send the reader nowhere."""
+    for raises in (subprocess.TimeoutExpired("runner", 240), FileNotFoundError(LOCAL)):
+        monkeypatch.setattr(tools.subprocess, "run", RecordingRun(raises=raises))
+        settings({"transport": "local"})
+        detail = call(tools)["detail"]
+        assert "ssh" not in detail.lower(), detail
+
+
+def test_local_non_json_output_becomes_a_json_envelope(tools, monkeypatch, settings) -> None:
+    monkeypatch.setattr(tools.subprocess, "run", RecordingRun(stdout="not json at all"))
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["error"] == "bad_response"
+
+
+def test_an_unresolvable_home_fails_closed(tools, monkeypatch, settings) -> None:
+    """expanduser gives up by returning its input; a relative argv[0] would
+    then be resolved against whatever directory Hermes happens to run in."""
+    recorder = RecordingRun()
+    monkeypatch.setattr(tools.subprocess, "run", recorder)
+    monkeypatch.setattr(tools.os.path, "expanduser", lambda value: value)
+    settings({"transport": "local"})
+    response = call(tools)
+    assert response["ok"] is False
+    assert response["error"] == "local_unavailable"
+    assert recorder.calls == [], "nothing may be executed from an unresolved path"
+
+
+# ── local argv injection guards ────────────────────────────────────────────
+
+@pytest.mark.parametrize("transport", [
+    42, "", "   ", "LOCAL", "Local", "carrier-pigeon", "ssh local", "local\nssh",
+    "local;rm -rf /", True, None, ["local"], {"mode": "local"},
+])
+def test_a_malformed_transport_falls_back_to_ssh(
+    tools, run_recorder, settings, transport
+) -> None:
+    settings({"transport": transport})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [
+        "ssh", "-o", "BatchMode=yes", "macbook", REMOTE, "rpc",
+    ]
+
+
+@pytest.mark.parametrize("command", HOSTILE_COMMANDS)
+def test_a_dangerous_local_command_falls_back_to_the_default(
+    tools, run_recorder, settings, command
+) -> None:
+    settings({"transport": "local", "local_command": command})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [LOCAL, "rpc"]
+
+
+@pytest.mark.parametrize("command", ORDINARY_COMMANDS)
+def test_ordinary_local_commands_are_accepted(
+    tools, run_recorder, settings, command
+) -> None:
+    settings({"transport": "local", "local_command": command})
+    call(tools)
+    assert run_recorder.calls[0]["argv"] == [os.path.expanduser(command), "rpc"]
+
+
+@pytest.mark.parametrize("command", [*HOSTILE_COMMANDS, *ORDINARY_COMMANDS, 42, None, ""])
+def test_the_local_argv_is_always_exactly_two_elements(
+    tools, run_recorder, settings, command
+) -> None:
+    """No setting may ever add an argv fragment of its own."""
+    settings({"transport": "local", "local_command": command})
+    call(tools)
+    argv = run_recorder.calls[0]["argv"]
+    assert len(argv) == 2
+    assert argv[1] == "rpc"
+    assert os.path.isabs(argv[0])
+
+
+def test_the_local_transport_never_invokes_ssh(tools, run_recorder, settings) -> None:
+    settings({"transport": "local", "ssh_host": "macbook"})
+    call(tools)
+    assert "ssh" not in run_recorder.calls[0]["argv"]
+
+
+# ── the local transport against a real process ─────────────────────────────
+
+def _stub_runner(tmp_path, body: str):
+    """A real executable that speaks the rpc contract on stdin/stdout."""
+    import sys
+
+    runner = tmp_path / "hermes-claude-runner"
+    runner.write_text(f"#!{sys.executable}\nimport json, sys\n{body}\n")
+    runner.chmod(0o755)
+    return runner
+
+
+def test_the_local_transport_really_executes_the_runner(tools, tmp_path, settings) -> None:
+    """Nothing mocked: the argv has to survive a real exec without a shell."""
+    runner = _stub_runner(tmp_path, (
+        'print(json.dumps({"ok": True, "result": '
+        '{"request": json.load(sys.stdin), "argv": sys.argv[1:]}}))'
+    ))
+    if not tools._LOCAL_COMMAND_RE.match(str(runner)):
+        pytest.skip(f"the temporary path {runner} is not a valid command shape")
+
+    settings({"transport": "local", "local_command": str(runner)})
+    response = call(tools, "claude_status", {"run_id": "rabc12345"})
+
+    assert response["ok"] is True, response
+    result = response["result"]
+    assert result["request"] == {"action": "status", "run_id": "rabc12345"}
+    assert result["argv"] == ["rpc"], "the runner is asked for rpc and nothing else"
+
+
+def test_a_real_missing_local_runner_becomes_a_json_envelope(
+    tools, tmp_path, settings
+) -> None:
+    missing = tmp_path / "not-installed"
+    if not tools._LOCAL_COMMAND_RE.match(str(missing)):
+        pytest.skip(f"the temporary path {missing} is not a valid command shape")
+
+    settings({"transport": "local", "local_command": str(missing)})
+    response = call(tools)
+
+    assert response["ok"] is False
+    assert response["error"] == "local_unavailable"
+    assert str(missing) in response["detail"]
+
+
+def test_a_real_local_runner_failure_becomes_a_json_envelope(
+    tools, tmp_path, settings
+) -> None:
+    runner = _stub_runner(tmp_path, 'sys.stderr.write("daemon not running\\n"); sys.exit(3)')
+    if not tools._LOCAL_COMMAND_RE.match(str(runner)):
+        pytest.skip(f"the temporary path {runner} is not a valid command shape")
+
+    settings({"transport": "local", "local_command": str(runner)})
+    response = call(tools)
+
+    assert response["ok"] is False
+    assert response["error"] == "local_failed"
+    assert "daemon not running" in response["detail"]

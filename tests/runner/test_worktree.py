@@ -248,3 +248,109 @@ def test_the_worktrees_root_itself_is_rejected(paths: RunnerPaths) -> None:
     with pytest.raises(RunnerError) as exc:
         worktree.resolve_project(str(paths.worktrees_root), paths)
     assert exc.value.code == "invalid_project"
+
+
+# ── reuse of an existing target ────────────────────────────────────────────
+
+def test_an_unrelated_repository_at_the_target_is_refused(paths: RunnerPaths) -> None:
+    """A standalone repo squatting on the target path is not our worktree.
+
+    ``rev-parse --show-toplevel`` happily reports it as a repository root, so
+    only the shared object store can tell it apart from a real reuse.
+    """
+    repo = make_repo(paths.projects_root / "demo")
+    target = worktree.worktree_path(paths, repo, "rabc12345")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    squatter = make_repo(target, initial_file="SQUATTER.md")
+    git(squatter, "checkout", "-q", "-b", "hermes/abc12345")
+
+    with pytest.raises(RunnerError) as exc:
+        worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert exc.value.code == "worktree_failed"
+    assert "different repository" in exc.value.detail
+    assert (target / "SQUATTER.md").read_text() == "hello\n", "existing work destroyed"
+
+
+def test_a_linked_worktree_of_another_repository_is_refused(
+    paths: RunnerPaths, tmp_path: Path
+) -> None:
+    repo = make_repo(paths.projects_root / "demo")
+    outside = make_repo(tmp_path / "outside", initial_file="OUTSIDE.md")
+    target = worktree.worktree_path(paths, repo, "rabc12345")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    git(outside, "worktree", "add", "-q", "-b", "hermes/abc12345", str(target))
+
+    with pytest.raises(RunnerError) as exc:
+        worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert exc.value.code == "worktree_failed"
+    assert "different repository" in exc.value.detail
+    assert (target / "OUTSIDE.md").read_text() == "hello\n", "existing work destroyed"
+    assert git(target, "rev-parse", "--abbrev-ref", "HEAD") == "hermes/abc12345"
+
+
+def test_reuse_is_refused_when_the_worktree_moved_to_another_branch(
+    paths: RunnerPaths,
+) -> None:
+    repo = make_repo(paths.projects_root / "demo")
+    info = worktree.create_worktree(paths, repo, "rabc12345")
+    (info.path / "work.txt").write_text("progress\n")
+    git(info.path, "checkout", "-q", "-b", "sidetrack")
+
+    with pytest.raises(RunnerError) as exc:
+        worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert exc.value.code == "worktree_failed"
+    assert "sidetrack" in exc.value.detail
+    assert "hermes/abc12345" in exc.value.detail
+    assert (info.path / "work.txt").read_text() == "progress\n", "existing work destroyed"
+    assert git(info.path, "rev-parse", "--abbrev-ref", "HEAD") == "sidetrack"
+
+
+def test_reuse_is_refused_on_a_detached_head(paths: RunnerPaths) -> None:
+    repo = make_repo(paths.projects_root / "demo")
+    info = worktree.create_worktree(paths, repo, "rabc12345")
+    (info.path / "work.txt").write_text("progress\n")
+    git(info.path, "checkout", "-q", "--detach")
+
+    with pytest.raises(RunnerError) as exc:
+        worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert exc.value.code == "worktree_failed"
+    assert "hermes/abc12345" in exc.value.detail
+    assert (info.path / "work.txt").read_text() == "progress\n", "existing work destroyed"
+
+
+def test_a_broken_gitfile_at_the_target_fails_as_a_worktree_error(
+    paths: RunnerPaths,
+) -> None:
+    """Git cannot read it, so it is refused as ``worktree_failed``.
+
+    ``not_a_git_repository`` is the code for the *project* argument; leaking it
+    from here would tell Hermes the wrong thing was misconfigured.
+    """
+    repo = make_repo(paths.projects_root / "demo")
+    target = worktree.worktree_path(paths, repo, "rabc12345")
+    target.mkdir(parents=True)
+    (target / ".git").write_text("gitdir: /nonexistent/admin/dir\n")
+
+    with pytest.raises(RunnerError) as exc:
+        worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert exc.value.code == "worktree_failed"
+    assert (target / ".git").read_text() == "gitdir: /nonexistent/admin/dir\n"
+
+
+def test_a_matching_worktree_of_the_same_repository_is_reused(paths: RunnerPaths) -> None:
+    """The positive control for the checks above: same repo, same branch."""
+    repo = make_repo(paths.projects_root / "demo")
+    first = worktree.create_worktree(paths, repo, "rabc12345")
+    (first.path / "work.txt").write_text("progress\n")
+
+    second = worktree.create_worktree(paths, repo, "rabc12345")
+
+    assert second.path == first.path
+    assert second.branch == "hermes/abc12345"
+    assert second.mode == "worktree"
+    assert (second.path / "work.txt").read_text() == "progress\n"

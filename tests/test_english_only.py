@@ -18,6 +18,7 @@ scan of the files alone.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -160,14 +161,66 @@ def test_the_cli_help_is_english() -> None:
         assert german_in(action.format_help()) == [], action.prog
 
 
-def test_the_doctors_rendered_report_is_english(tmp_path: Path) -> None:
-    paths = config.paths_from_env({}, home=tmp_path / "home")
+#: Every machine state the doctor has prose for. Rendering one state would
+#: leave the sentences the other four print unscanned.
+DOCTOR_STATES = {
+    "signed-in": {},
+    "logged-out": {"auth_stdout": '{"loggedIn": false}'},
+    "too-old-for-the-auth-probe": {
+        "auth_stdout": "", "auth_stderr": "error: unknown command auth", "auth_exit": 1,
+    },
+    "unreadable-auth-answer": {"auth_stdout": "not json"},
+    "unusable-binary": {"version_stdout": "", "version_stderr": "boom", "version_exit": 1},
+}
+
+
+@pytest.mark.parametrize("state", list(DOCTOR_STATES), ids=list(DOCTOR_STATES))
+def test_the_doctors_rendered_report_is_english(tmp_path: Path, state: str) -> None:
+    """Hermetic on purpose: this used to fall through to the real Claude Code.
+
+    With no binary at the disposable home the doctor consulted PATH, so a
+    publication gate ran the caller's own CLI and its auth probe — and the
+    states that binary was not in went unscanned.
+    """
+    from tests.runner.test_doctor import fake_claude
+
+    home = tmp_path / "home"
+    cli = fake_claude(home / ".local" / "bin" / "claude", **DOCTOR_STATES[state])
+    paths = config.paths_from_env({}, home=home)
+    assert paths.claude_cli_path == cli, "the fake is not where the doctor looks"
+
     report = doctor.diagnose(paths, probe_daemon=False)
 
     rendered = doctor.render(report)
     assert german_in(rendered) == []
     for entry in report["checks"]:
         assert german_in(f"{entry['detail']} {entry['fix']}") == [], entry["name"]
+
+
+def test_the_publication_gate_never_runs_the_real_claude(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Proof, not intent: the binary this gate spawns is the disposable one."""
+    from tests.runner.test_doctor import fake_claude
+
+    spawned: list[str] = []
+    spawn = doctor._spawn  # noqa: SLF001
+
+    def record(argv):  # type: ignore[no-untyped-def]
+        spawned.append(str(argv[0]))
+        return spawn(argv)
+
+    monkeypatch.setattr(doctor, "_spawn", record)
+    home = tmp_path / "home"
+    fake_claude(home / ".local" / "bin" / "claude")
+    doctor.diagnose(config.paths_from_env({}, home=home), probe_daemon=False)
+
+    assert spawned, "the gate no longer exercises the probes at all"
+    real = shutil.which("claude")
+    for binary in spawned:
+        assert binary != real, f"the publication gate ran the real CLI at {binary}"
+        assert Path.home() not in Path(binary).parents, binary
+        assert str(tmp_path) in binary, binary
 
 
 def test_the_installers_own_usage_text_is_english() -> None:

@@ -57,6 +57,20 @@ class _Session:
         run = self.store.get_run(self.run_id)
         return bool(run and run["stop_requested"])
 
+    def stop_on_record(self) -> bool:
+        """Like :meth:`stop_flag_set`, but safe to ask while handling a failure.
+
+        Whatever just broke may be the store itself, so an unreadable flag
+        means "no stop was requested" — a genuine failure is never rewritten
+        into a stop.
+        """
+        if self.stop_requested or self.external_stop.is_set():
+            return True
+        try:
+            return self.stop_flag_set()
+        except Exception:  # noqa: BLE001 - a broken store must not mask the failure
+            return False
+
     def record(self, kind: str, payload: dict[str, Any]) -> None:
         self.store.append_event(self.run_id, kind, payload)
 
@@ -330,15 +344,25 @@ async def run_worker(
     except asyncio.CancelledError:
         # A cancelled worker never finished; only a requested stop is a "stop".
         final_status = (
-            models.STATUS_STOPPED if session.stop_requested else models.STATUS_UNKNOWN
+            models.STATUS_STOPPED if session.stop_on_record() else models.STATUS_UNKNOWN
         )
         session.record("error", {"code": "worker_cancelled", "detail": final_status})
     except BaseException as exc:  # noqa: BLE001 - every failure is recorded, never swallowed
-        final_status = models.STATUS_FAILED
-        error_detail = event_serializer.truncate(
+        detail = event_serializer.truncate(
             redact_text(f"{exc.__class__.__name__}: {exc}"), 2000
         )[0]
-        session.record("error", {"code": "worker_failed", "detail": error_detail})
+        if session.stop_on_record():
+            # A controlled stop tears down the worker's whole process group, so
+            # the CLI dies under the SDK and the turn raises. That exception is
+            # the stop landing, not a failure: the run stopped as asked, and the
+            # worktree and session are preserved exactly as on any other stop.
+            session.stop_requested = True
+            final_status = models.STATUS_STOPPED
+            session.record("error", {"code": "worker_stopped_mid_turn", "detail": detail})
+        else:
+            final_status = models.STATUS_FAILED
+            error_detail = detail
+            session.record("error", {"code": "worker_failed", "detail": detail})
     finally:
         if client is not None:
             with contextlib.suppress(Exception):

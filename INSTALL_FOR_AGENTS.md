@@ -69,12 +69,25 @@ with a `fix` string carrying the exact command. Map them:
 | `python` | Python older than 3.12 | `uv python install 3.12`, then re-run |
 | `uv` | uv missing | **Blocks.** Every command here is `uv run …`, and the installer runs `uv sync`. Install it: <https://docs.astral.sh/uv/> |
 | `git` | git missing | `xcode-select --install` — needs a human to click through |
-| `claude_cli` | Claude Code missing or not signed in | **STOP** — see step 2 |
+| `agent_sdk` | `claude-agent-sdk` is not importable, or older than the version `pyproject.toml` pins | `uv sync` in the checkout, then re-run |
+| `claude_cli` | Claude Code is missing, is not an executable file, or cannot report a version | **STOP** — see step 2 |
+| `claude_auth` | Claude Code runs but reports no signed-in session, or is too old to answer `claude auth status --json` | **STOP** — see step 2. Only a human can sign in; no installer can. |
 | `projects_root` | The projects root does not exist | Ask the human where their code lives; set `HERMES_CLAUDE_RUNNER_PROJECTS_ROOT` |
 | `daemon`, `launch_agent`, `wrapper` | Not installed yet | Expected on a first install. These are what `installable` allows. |
 
 `database` and `node` are the only non-required checks. Node is an implementation detail of
-some Claude Code installs and absent from others; `claude_cli` is the check that matters.
+some Claude Code installs and absent from others; `claude_cli` and `claude_auth` are the
+checks that matter.
+
+`agent_sdk`, `claude_cli` and `claude_auth` each carry a `state` field alongside `ok`, so
+you can branch on a value instead of reading prose:
+
+- `claude_cli`: `ready`, `missing`, `not_executable`, `timeout`, `failed`, `unrecognized`
+- `claude_auth`: `signed_in`, `logged_out`, `timeout`, `incompatible`, `unverifiable`
+- `agent_sdk`: `ready`, `missing`, `too_old`, `unrecognized`
+
+A signed-out machine is **not** `installable`, however complete the rest of it is. That is
+deliberate: installing cannot sign anybody in.
 
 ---
 
@@ -83,16 +96,20 @@ some Claude Code installs and absent from others; `claude_cli` is the check that
 The runner drives the Mac's existing Claude Code installation and its OAuth session. It
 never handles credentials.
 
-**You must stop here if `doctor` reported `claude_cli` as failing, or if you cannot confirm
-a signed-in session.** Ask the human to:
+**You must stop here if `doctor` reported `claude_cli` or `claude_auth` as failing.**
+`claude_auth` with `state: "logged_out"` is exactly this step and nothing else; with
+`state: "incompatible"` the install is too old to be asked, and needs `claude update`
+first. Ask the human to:
 
 1. Install Claude Code from <https://claude.com/claude-code>.
 2. Run `claude` once and complete the browser sign-in.
 
-You may verify afterwards with a read-only command:
+You may verify afterwards with read-only commands — the same two the doctor runs, and the
+only two it will ever run:
 
 ```sh
 command -v claude && claude --version
+claude auth status --json
 ```
 
 Do not attempt the login yourself. Do not read any file under `~/.claude/` looking for a
@@ -141,7 +158,10 @@ This changes nothing. It prints one object:
 {"ok": true, "dry_run": true, "label": "com.hermes-claude-sdk.runner",
  "plist": "/Users/me/Library/LaunchAgents/com.hermes-claude-sdk.runner.plist",
  "wrapper": "/Users/me/.local/bin/hermes-claude-runner",
- "install": {"wrapper": {"action": "would_create"}, "plist": {"action": "would_create"}},
+ "install": {"runtime": {"action": "would_provision", "generation": null, "previous": null,
+                         "generations": [],
+                         "entrypoint": "/Users/me/Library/Application Support/HermesClaudeRunner/runtime/current/bin/hermes-claude-runner"},
+             "wrapper": {"action": "would_create"}, "plist": {"action": "would_create"}},
  "health": null}
 ```
 
@@ -149,6 +169,14 @@ Inside `install`, `wrapper.action` and `plist.action` are `would_create` (fresh 
 `would_replace` (upgrade) or `unchanged` (already current). **If either says
 `would_replace`, tell the human which file you are about to replace before continuing.** A
 timestamped `.bak-…` copy is kept either way.
+
+`install.runtime` describes the **managed runtime** the service will actually run from: one
+virtualenv per install generation, plus a `current` symlink the wrapper follows.
+`generations` lists every generation kept so far — nothing is ever deleted, so an upgrade
+stays reversible. `previous` names the generation that was live *before* the swap and is
+filled only by a real install; a dry run always leaves it `null`, so read `generations` to
+see what already exists. The checkout is only the *source*: after installing it can be
+moved or deleted without stopping the daemon.
 
 ---
 
@@ -165,8 +193,15 @@ What this changes, and nothing else:
 | `~/.local/bin/hermes-claude-runner` | Written (previous version backed up) |
 | `~/Library/LaunchAgents/com.hermes-claude-sdk.runner.plist` | Written (previous version backed up) |
 | `~/Library/Logs/HermesClaudeRunner/` | Created if absent |
-| `~/Library/Application Support/HermesClaudeRunner/` | Created if absent |
+| `~/Library/Application Support/HermesClaudeRunner/` | Created if absent, and its state made private (`0700`; `data.db` and its `-wal`/`-shm` companions `0600`) |
+| `~/Library/Application Support/HermesClaudeRunner/runtime/` | A new generation is provisioned and `current` is pointed at it. Earlier generations are kept, never deleted |
 | launchd | The agent is booted out, bootstrapped and kickstarted |
+
+The runtime is provisioned **first**, and `current` is swapped only after that generation's
+own entrypoint has been verified. A provision that fails at any step leaves the previous
+generation live and the wrapper and plist pointing at it, so a failed install never leaves a
+half-installed service. Two installers running at once serialize on an exclusive lock rather
+than interleaving.
 
 **Machine-readable success criteria:**
 
@@ -174,7 +209,17 @@ What this changes, and nothing else:
 install.ok            == true
 install.health.ok     == true
 install.install.wrapper.action ∈ {"created", "replaced", "unchanged"}
+install.install.runtime.action == "created"
 ```
+
+`runtime.action` is `created` on a real install and `would_provision` on a dry run. It is
+`skipped` only when the tree you pointed at is not a source checkout — running `install`
+from the managed runtime itself, where there is nothing to build from; on the install path
+described here, `skipped` means you passed the wrong root.
+
+`install.ok` is `false` if the installed wrapper still names the checkout: the installer
+checks that explicitly, because a wrapper pointing back into the source tree stops working
+the moment that tree is moved.
 
 Then confirm independently:
 
@@ -256,11 +301,20 @@ exit == 0
 output contains "registrations: 7 tool(s)"
 ```
 
-Then confirm the transport end to end:
+Then confirm the transport end to end. Over ssh:
 
 ```sh
 ssh -o BatchMode=yes <host> '~/.local/bin/hermes-claude-runner' health
 ```
+
+If Hermes runs **on the Mac itself**, there is no ssh hop to confirm — run the wrapper
+directly instead, and configure `transport: local` in step 9:
+
+```sh
+~/.local/bin/hermes-claude-runner health
+```
+
+Either way:
 
 ```
 .ok == true   and   .result.status == "ok"
@@ -274,7 +328,7 @@ ssh -o BatchMode=yes <host> '~/.local/bin/hermes-claude-runner' health
 Editing a human's `~/.hermes/config.yaml` is editing their environment.
 
 **Show them the block and ask them to apply it** (or ask for explicit permission to write
-it):
+it). If Hermes runs on a different machine than the Mac:
 
 ```yaml
 plugins:
@@ -282,13 +336,35 @@ plugins:
   entries:
     hermes-claude-sdk:
       settings:
+        transport: ssh
         ssh_host: <their-mac-ssh-host>
         remote_command: ~/.local/bin/hermes-claude-runner
         timeout_seconds: 240
 ```
 
-`timeout_seconds` below 240 is silently raised to 240 — a shorter wait would report
-`ssh_timeout` for a run that really started. Do not "optimise" it downward.
+If Hermes runs **on the Mac that hosts the runner**, use the local transport instead — it
+needs no sshd, no key and no loopback round trip:
+
+```yaml
+plugins:
+  enabled: [hermes-claude-sdk]
+  entries:
+    hermes-claude-sdk:
+      settings:
+        transport: local
+        local_command: ~/.local/bin/hermes-claude-runner
+        timeout_seconds: 240
+```
+
+`transport` defaults to `ssh`, and an unrecognised value falls back to it, so an existing
+install that never set it does not move. `local_command` is validated exactly like
+`remote_command` — home-relative or absolute, no shell metacharacters — and because no
+login shell is involved the plugin expands the `~` itself and refuses anything that does
+not resolve to an absolute path. Local failures report `local_timeout`, `local_failed` or
+`local_unavailable` rather than an `ssh_*` code, so the fix never points at `ssh_host`.
+
+`timeout_seconds` below 240 is silently raised to 240, on either transport — a shorter wait
+would report a timeout for a run that really started. Do not "optimise" it downward.
 
 ---
 
@@ -315,8 +391,23 @@ Every step above is reversible without losing state.
 ```sh
 # Runner (Mac) — stops the service, moves the plist and wrapper aside with a timestamp.
 ./scripts/uninstall.sh
+```
 
-# Restore the exact previous version instead, if this was an upgrade:
+**To go back one version instead of uninstalling, swap the runtime generation.** Every
+generation is kept, so this deletes nothing and is itself reversible. The installer's
+`--json` verdict prints the exact two commands under `install.rollback`; they have the
+shape:
+
+```sh
+ls ~/Library/Application\ Support/HermesClaudeRunner/runtime/versions/   # pick the previous one
+ln -sfn versions/<generation> ~/Library/Application\ Support/HermesClaudeRunner/runtime/current
+launchctl kickstart -k gui/$(id -u)/com.hermes-claude-sdk.runner
+```
+
+The wrapper follows `current`, so it does not have to be rewritten. If you need the wrapper
+file itself back, the installer kept a timestamped copy:
+
+```sh
 ls ~/.local/bin/hermes-claude-runner.bak-*                   # pick the newest
 cp <backup> ~/.local/bin/hermes-claude-runner
 ```
@@ -326,8 +417,8 @@ cp <backup> ~/.local/bin/hermes-claude-runner
 ls -d ~/.hermes/plugins/hermes-claude-sdk.bak-*
 ```
 
-`uninstall.sh` deliberately preserves the database, the worktrees and the logs. **Do not
-delete them.** If the human asks you to, tell them what each one holds and let them do it.
+`uninstall.sh` deliberately preserves the database, the worktrees, the logs and the managed
+runtime. **Do not delete them.** If the human asks you to, tell them what each one holds and let them do it.
 
 ---
 

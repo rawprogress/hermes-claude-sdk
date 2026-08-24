@@ -19,12 +19,20 @@ from pathlib import Path
 # existed keeps working: point HERMES_CLAUDE_RUNNER_LABEL at its old label.
 DEFAULT_LAUNCH_AGENT_LABEL = "com.hermes-claude-sdk.runner"
 WORKTREES_DIR_NAME = ".hermes-claude-worktrees"
+# The managed runtime: one virtualenv per install generation, plus a
+# ``current`` symlink the installed entrypoint follows. It deliberately sits
+# beside the database rather than inside a checkout, so moving or deleting the
+# source tree cannot disarm the service.
+RUNTIME_DIR_NAME = "runtime"
+RUNTIME_GENERATIONS_DIR_NAME = "versions"
+RUNTIME_LINK_NAME = "current"
 
 ENV_HOME = "HERMES_CLAUDE_RUNNER_HOME"
 ENV_PROJECTS_ROOT = "HERMES_CLAUDE_RUNNER_PROJECTS_ROOT"
 ENV_WORKTREES_ROOT = "HERMES_CLAUDE_RUNNER_WORKTREES_ROOT"
 ENV_SOCKET = "HERMES_CLAUDE_RUNNER_SOCKET"
 ENV_LOG_DIR = "HERMES_CLAUDE_RUNNER_LOG_DIR"
+ENV_RUNTIME = "HERMES_CLAUDE_RUNNER_RUNTIME"
 ENV_CLAUDE_CLI = "HERMES_CLAUDE_RUNNER_CLAUDE_CLI"
 ENV_LABEL = "HERMES_CLAUDE_RUNNER_LABEL"
 
@@ -42,6 +50,7 @@ class RunnerPaths:
     worktrees_root: Path
     socket_path: Path
     log_dir: Path
+    runtime_dir: Path
     wrapper_path: Path
     plist_path: Path
     claude_cli_path: Path
@@ -54,6 +63,21 @@ class RunnerPaths:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "data.db"
+
+    @property
+    def runtime_versions_dir(self) -> Path:
+        """Where each install generation's virtualenv is kept."""
+        return self.runtime_dir / RUNTIME_GENERATIONS_DIR_NAME
+
+    @property
+    def runtime_link(self) -> Path:
+        """The symlink that decides which generation is live."""
+        return self.runtime_dir / RUNTIME_LINK_NAME
+
+    @property
+    def runtime_entrypoint(self) -> Path:
+        """The stable executable the LaunchAgent's wrapper runs."""
+        return self.runtime_link / "bin" / "hermes-claude-runner"
 
 
 def _resolve(env: Mapping[str, str], key: str, fallback: Path) -> Path:
@@ -98,6 +122,7 @@ def paths_from_env(
         worktrees_root=_resolve(env, ENV_WORKTREES_ROOT, projects_root / WORKTREES_DIR_NAME),
         socket_path=_resolve(env, ENV_SOCKET, data_dir / "daemon.sock"),
         log_dir=_resolve(env, ENV_LOG_DIR, home / "Library/Logs/HermesClaudeRunner"),
+        runtime_dir=_resolve(env, ENV_RUNTIME, data_dir / RUNTIME_DIR_NAME),
         wrapper_path=home / ".local/bin/hermes-claude-runner",
         plist_path=home / f"Library/LaunchAgents/{label}.plist",
         claude_cli_path=_resolve(env, ENV_CLAUDE_CLI, home / ".local/bin/claude"),

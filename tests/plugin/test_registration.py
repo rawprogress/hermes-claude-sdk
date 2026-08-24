@@ -123,6 +123,14 @@ def test_manifest_config_schema_covers_the_transport_settings() -> None:
     assert schema["remote_command"]["default"] == "~/.local/bin/hermes-claude-runner"
     assert schema["timeout_seconds"]["type"] in ("int", "integer")
     assert schema["timeout_seconds"]["default"] > 0
+    assert schema["transport"]["default"] == "ssh", "existing installs must not move"
+    assert schema["local_command"]["default"] == "~/.local/bin/hermes-claude-runner"
+
+
+def test_manifest_documents_both_transports() -> None:
+    """A setting nobody can discover is a setting nobody will use correctly."""
+    text = manifest()["config_schema"]["transport"]["description"]
+    assert "ssh" in text and "local" in text
 
 
 def test_manifest_defaults_match_the_transports_own_defaults(tools: Any) -> None:
@@ -131,6 +139,13 @@ def test_manifest_defaults_match_the_transports_own_defaults(tools: Any) -> None
     assert schema["ssh_host"]["default"] == tools.DEFAULT_SSH_HOST
     assert schema["remote_command"]["default"] == tools.DEFAULT_REMOTE_COMMAND
     assert schema["timeout_seconds"]["default"] == tools.DEFAULT_TIMEOUT_SECONDS
+    assert schema["transport"]["default"] == tools.DEFAULT_TRANSPORT
+    assert schema["local_command"]["default"] == tools.DEFAULT_LOCAL_COMMAND
+
+
+def test_every_documented_setting_reaches_the_transport(plugin: Any) -> None:
+    """register() only forwards the keys it knows; a missing one is invisible."""
+    assert set(manifest()["config_schema"]) == set(plugin._SETTING_KEYS)
 
 
 def test_no_documented_default_names_one_persons_machine() -> None:

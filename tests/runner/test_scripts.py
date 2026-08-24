@@ -58,6 +58,17 @@ def test_no_script_hardcodes_one_persons_machine(name: str) -> None:
     assert homes == [], f"{name} hardcodes the home directory of {homes}"
 
 
+@pytest.mark.parametrize("name", NAMES)
+def test_no_script_pins_the_service_to_a_checkout_venv(name: str) -> None:
+    """The installed service runs from the managed runtime, never from .venv.
+
+    A checkout's virtualenv disappears when the checkout is moved or deleted,
+    and an install that depends on one is a service with a hidden expiry date.
+    """
+    text = (SCRIPTS / name).read_text()
+    assert ".venv" not in text, f"{name} wires something to a checkout virtualenv"
+
+
 @pytest.mark.parametrize("name", ("install_runner.sh", "uninstall.sh"))
 def test_label_default_matches_the_package(name: str) -> None:
     """One source of truth: the scripts and the package must agree."""
@@ -223,6 +234,38 @@ def test_installer_honours_an_existing_installs_label(tmp_path: Path) -> None:
 
     assert json.loads(completed.stdout)["label"] == INVENTED_LABEL
     assert INVENTED_LABEL in log.read_text()
+
+
+def test_installer_provisions_the_runtime_from_the_checkout(tmp_path: Path) -> None:
+    """The checkout is the *source* of the install, never a runtime dependency."""
+    env, log = _sandbox(tmp_path)
+    _run_installer(env, "--json", "--skip-verify")
+
+    calls = log.read_text()
+    assert f"install --repo-root {REPO_ROOT}" in calls, (
+        "the installer must tell the runner which checkout to provision from"
+    )
+
+
+def test_installer_refuses_to_claim_success_when_the_wrapper_names_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """The regression this lane exists to prevent, caught on the user's Mac."""
+    env, _ = _sandbox(tmp_path)
+    wrapper = Path(env["HOME"]) / ".local" / "bin" / "hermes-claude-runner"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"# TARGET={REPO_ROOT}/somewhere/bin/hermes-claude-runner\n"
+        "printf '{\"ok\":true,\"result\":{\"status\":\"ok\"}}\\n'\n"
+    )
+    wrapper.chmod(0o755)
+
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    payload = json.loads(completed.stdout)  # still exactly one object on stdout
+    assert payload["health"]["ok"] is True, "the daemon answered; this is not a health failure"
+    assert payload["ok"] is False
+    assert completed.returncode != 0
 
 
 def test_installer_rejects_an_unknown_flag(tmp_path: Path) -> None:

@@ -6,8 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `transport: local` reaches a runner on the same machine without ssh. The plugin runs the
+  validated runner command plus `rpc` directly: a fixed argv of exactly two elements, never
+  a shell, with `local_command` held to the same "`~/…` or absolute, no metacharacters"
+  shape as `remote_command` by one shared pattern. Because no login shell is involved the
+  plugin expands the tilde itself and refuses anything that does not resolve to an absolute
+  path, rather than letting a relative command resolve against Hermes' working directory.
+  The default is unchanged — an install that never heard of `transport` keeps its ssh argv
+  byte for byte, and an unrecognised value falls back to ssh.
+- Local failures carry their own codes, `local_timeout`, `local_unavailable` and
+  `local_failed`, because an `ssh_timeout` naming `ssh_host` would send the reader to a
+  setting that had no part in the failure. The envelope shape and the 240 s floor are
+  shared: local mode removes the ssh hop, not the runner's inline worktree and socket wait.
+
 ### Changed
 
+- **The installed service runs from a managed runtime, not from the checkout.** The
+  LaunchAgent used to exec `<checkout>/.venv/bin/hermes-claude-runner`, so moving or
+  deleting the source tree silently disarmed the daemon. `install` now provisions one
+  virtualenv per install generation under `HERMES_CLAUDE_RUNNER_RUNTIME` (default
+  `<data dir>/runtime`), holding a non-editable copy of the package, plus a `current`
+  symlink the wrapper follows. `uv sync --frozen` installs what the checkout locked, so
+  provisioning cannot re-resolve or rewrite the lockfile. The checkout can be renamed or
+  deleted afterwards without stopping the service.
+- Install ordering is the safety property: allocate a generation, sync, verify its console
+  script, write the manifest, swap the symlink, and only then rewrite the wrapper and
+  plist. A provision that fails at any step raises with the previous generation still live
+  and still current. An exclusive lock covers allocation, sync, activation and rollback, so
+  two installers serialize instead of handing out the same generation. Every generation is
+  kept, which makes going back a symlink swap; running workers keep the runtime they
+  started from. The installer also checks that the wrapper it installed names nothing in
+  the checkout, and records the answer in its verdict rather than exiting early, so
+  `--json` still prints exactly one object.
 - `doctor` now proves Claude Code is usable rather than merely present. `claude_cli`
   resolves the binary, requires it to be an executable file, and makes it report its
   version. Two new required checks join it: `claude_auth`, which asks
@@ -31,8 +63,41 @@ All notable changes to this project are documented here. The format follows
   anchor on the one token that has to be there — the credential word, the `@` —
   and walk outwards. Nothing about what counts as a secret changed.
 
+### Fixed
+
+- **A stop now stops the whole worker process group, not just its pid.** Only the worker
+  was signalled, so the Claude CLI it spawned kept running against the run's worktree. The
+  group is signalled only when the worker provably leads both it and its session
+  (`sid == pgid == pid`, which is what every spawned worker gets), never when it is the
+  daemon's own group; anything else falls back to the single-pid signal. The existing
+  identity proof still runs last, immediately before the signal, so a recycled or unrelated
+  pid is never touched.
+- **A requested stop is no longer finalized as `failed`.** Terminating the group tears the
+  CLI down under the SDK, so the turn raises mid-flight; the worker treated that as a
+  crash. It now asks whether a stop is on record: with one the run ends `stopped`, with the
+  usual preserved worktree and the SDK error kept in the event trail, and without one the
+  same exception still fails the run. An unreadable stop flag counts as no stop, so a broken
+  store can never rewrite a genuine failure into a stop.
+- **An existing worktree is proven to belong to the run before it is reused.** Reuse only
+  checked that the target was some repository root, so a standalone repository initialised
+  at that path, or a linked worktree of a different repository, was silently adopted and the
+  run's commits landed in a repository nobody asked for; a worktree that had wandered onto
+  another branch was adopted too. Reuse now requires two proofs from git — the same shared
+  object store as the project, and the run's own branch checked out — and a target that
+  fails either is refused as `worktree_failed` exactly as it stands. Nothing is deleted,
+  reset, cleaned or stashed. A probe git cannot answer stays `worktree_failed`, so
+  `not_a_git_repository` keeps speaking only for the project argument.
+
 ### Security
 
+- **The runner's state on disk is private.** The database carries prompts, results and
+  session identifiers but was created with whatever the caller's umask allowed — `0755`
+  state directories and a `0644` database, `-wal` and `-shm` under a common umask of 022.
+  `db.connect` now creates every state directory it makes at `0700` and the database file
+  at `0600` before SQLite opens it, which is what makes SQLite create the sidecars privately
+  too. Directories and files that already exist lose their group and world bits, so an
+  installation predating this is tightened without touching its data; a path owned by
+  another account is skipped rather than turned into an error.
 - No part of the auth payload reaches a report, on any path. Only `loggedIn` and the
   non-identifying mode fields are read: the account's address and organisation stay inside
   the CLI, and a non-zero exit is classified rather than quoted back.

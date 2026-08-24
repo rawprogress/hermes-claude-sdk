@@ -34,9 +34,10 @@ Hermes host (Linux/macOS)                    Mac (macOS, Apple Silicon or Intel)
 
 Four moving parts, in the order a request passes through them:
 
-1. **The plugin** holds no state. It runs exactly one command shape —
-   `ssh -o BatchMode=yes <host> <runner> rpc` — and passes the request as JSON on stdin.
-   Never a shell, never a third-party dependency in the Hermes venv.
+1. **The plugin** holds no state. It runs exactly one fixed command shape: over ssh that is
+   `ssh -o BatchMode=yes <host> <runner> rpc`, and with `transport: local` it is the runner
+   itself plus `rpc`, nothing else. Either way the request is JSON on stdin. Never a shell,
+   never a third-party dependency in the Hermes venv.
 2. **`hermes-claude-runner rpc`** is a thin pipe to the daemon's unix socket. It writes one
    JSON envelope to stdout and nothing else; all logging goes to stderr.
 3. **The daemon** owns runs. Commands return quickly: it creates the git worktree, spawns a
@@ -48,6 +49,14 @@ Every reply is `{"ok": true, "result": {…}}` or
 `{"ok": false, "error": "<stable_code>", "detail": "<human readable>"}`. Always.
 
 Run lifecycle: `queued → preparing → working → completed | blocked | failed | stopped | unknown`.
+
+**The installed service does not run from this checkout.** `install_runner.sh` provisions a
+*managed runtime* — one virtualenv per install generation under
+`~/Library/Application Support/HermesClaudeRunner/runtime/versions/`, with a `current`
+symlink that the installed wrapper follows. The checkout is only ever the *source* of an
+install, so it can be renamed, moved or deleted afterwards without disarming the daemon.
+Every generation is kept, which makes going back to the previous one a symlink swap rather
+than a reinstall.
 
 ### Where things live
 
@@ -65,8 +74,8 @@ Run lifecycle: `queued → preparing → working → completed | blocked | faile
 | Where | What |
 | --- | --- |
 | Mac | macOS, Python 3.12+, [uv](https://docs.astral.sh/uv/), git, [Claude Code](https://claude.com/claude-code) **already signed in**. Node.js only if your Claude Code install needs it — `doctor` reports it without blocking |
-| Hermes host | Hermes Agent with plugin support, `ssh` and `scp` |
-| Between them | Passwordless SSH from the Hermes host to the Mac (`ssh <host> true` must succeed) |
+| Hermes host | Hermes Agent with plugin support. `ssh` and `scp` only when Hermes runs on a *different* machine than the Mac |
+| Between them | Passwordless SSH from the Hermes host to the Mac (`ssh <host> true` must succeed). Nothing at all when Hermes runs *on* the Mac — see [`transport: local`](#hermes-on-the-mac-itself) |
 
 The runner is a macOS LaunchAgent, so the Mac side is macOS-only by design.
 
@@ -106,6 +115,7 @@ plugins:
   entries:
     hermes-claude-sdk:
       settings:
+        transport: ssh                                # the default
         ssh_host: my-mac                              # your ssh destination
         remote_command: ~/.local/bin/hermes-claude-runner
         timeout_seconds: 240                          # 240 is also the enforced floor
@@ -113,6 +123,34 @@ plugins:
 
 `ssh_host` is the only setting most people need to change. `remote_command` is
 home-relative by default, so it resolves for whichever account runs the runner.
+
+#### Hermes on the Mac itself
+
+When Hermes runs on the very Mac that hosts the runner, ssh is configuration that exists
+only to reach localhost. Set `transport: local` — step 2's ssh checks then do not apply:
+
+```yaml
+plugins:
+  enabled: [hermes-claude-sdk]
+  entries:
+    hermes-claude-sdk:
+      settings:
+        transport: local
+        local_command: ~/.local/bin/hermes-claude-runner
+        timeout_seconds: 240
+```
+
+The plugin then runs the wrapper plus `rpc` directly. The argv stays fixed and exactly two
+elements long and never goes through a shell; `local_command` is held to the same
+"`~/…` or absolute, no metacharacters" shape as `remote_command`. Because no login shell is
+involved the plugin expands the `~` itself and refuses anything that does not resolve to an
+absolute path, rather than letting a relative command be resolved against Hermes' working
+directory.
+
+`transport` defaults to `ssh` and an unrecognised value falls back to it, so an install
+that never heard of this setting keeps its ssh argv byte for byte. Local mode removes the
+ssh hop and nothing else: the envelope shape and the 240 s floor are the same, because the
+runner still creates the git worktree inline.
 
 ---
 
@@ -232,6 +270,18 @@ All three are optional.
 
 The worktree, the branch, the Claude session id and every event survive.
 
+A stop signals the worker's **whole process group**, so the `claude` CLI the worker spawned
+goes down with it instead of running on against the run's worktree. The group is signalled
+only when the worker provably leads both it and its own session — anything else falls back
+to signalling the single pid, and the daemon never signals the group it is in itself.
+Identity is proven immediately before the signal, so a recycled pid is never touched.
+
+Tearing the CLI down mid-turn makes the SDK raise, and that exception is the stop landing
+rather than a failure: with a stop on record the run ends `stopped`, with the usual
+preserved worktree and the SDK error kept in the event trail. Without one, the same
+exception still ends the run `failed` — a store too broken to answer counts as no stop, so
+a genuine failure is never rewritten into a stop.
+
 ### `claude_resume` — pick the same conversation back up
 
 ```json
@@ -254,6 +304,7 @@ cleans or stashes anything.
 | Symptom | What it means | What to do |
 | --- | --- | --- |
 | `ssh_failed` / `ssh_timeout` | The Hermes host cannot reach the Mac | `ssh <host> true`; check the plugin's `ssh_host` / `remote_command` settings |
+| `local_failed` / `local_timeout` / `local_unavailable` | `transport: local` could not run the runner on this machine | Check the plugin's `local_command`; `~/.local/bin/hermes-claude-runner health` must answer |
 | `daemon_unavailable` | The LaunchAgent is not listening | `launchctl kickstart -k gui/$(id -u)/com.hermes-claude-sdk.runner`, then `hermes-claude-runner health` |
 | `invalid_project` | The path is outside the projects root, or escapes it via a symlink | Use a repository under `~/Projects` on the Mac |
 | `not_a_git_repository` | The path is contained, but there is no git checkout there | `git init` it, or point at the repository root |
@@ -262,7 +313,7 @@ cleans or stashes anything.
 | Status `unknown` | The worker vanished with no final result — never a success | Read `claude_events`, then `claude_resume` |
 | Status `failed` | The SDK reported an error, or the worker crashed | `claude_events` shows the `error` event; `claude_resume` retries in the same session |
 | Status `blocked` | An escalated tool is waiting for an answer | Read the `blocked` event, then `claude_send(run_id, "<your answer>")`. Does not occur with the default escalation set — see [Security](#security) |
-| `worktree_failed` | The target directory exists and is not a worktree | Inspect it by hand; the runner will not reset anything |
+| `worktree_failed` | The target exists and is not this run's own worktree — not a worktree at all, a different repository, or the wrong branch | Inspect it by hand; the runner refuses it as it stands and will not reset anything |
 
 ### Every error code
 
@@ -277,7 +328,7 @@ never renamed silently.
 | `unknown_run` | no run with that id |
 | `invalid_project` | missing, outside the projects root, or escaping it via a symlink |
 | `not_a_git_repository` | inside the projects root, but not a git checkout |
-| `worktree_failed` | `git worktree add` or `rev-parse` failed |
+| `worktree_failed` | `git worktree add` or `rev-parse` failed, or an existing target could not be proven to be this run's worktree |
 | `daemon_unavailable` | the LaunchAgent daemon is not accepting connections |
 | `run_not_resumable` | the run is still live, or has no session to resume |
 | `no_claude_session` | resume requested before a Claude session id was captured |
@@ -287,14 +338,18 @@ never renamed silently.
 | `internal_error` | unexpected failure; the detail is redacted |
 
 The plugin adds its own, for failures that never reach the Mac: `ssh_timeout`,
-`ssh_failed`, `ssh_unavailable`, `bad_response`, `response_too_large`, `plugin_error`.
+`ssh_failed`, `ssh_unavailable`, `bad_response`, `response_too_large`, `plugin_error`, and
+on `transport: local` the matching `local_timeout`, `local_failed` and `local_unavailable`.
+The code names the transport that actually failed, so it never sends a reader to a setting
+that had no part in it.
 
 Start every diagnosis with `uv run hermes-claude-runner doctor` — it names the missing
 piece and the command that fixes it.
 
 **Logs.** `~/Library/Logs/HermesClaudeRunner/{stdout,stderr}.log` for the daemon,
 `worker-<run-id>.log` for each run.
-**State.** `~/Library/Application Support/HermesClaudeRunner/data.db`.
+**State.** `~/Library/Application Support/HermesClaudeRunner/data.db`, mode `0600`. The
+managed runtime sits beside it under `runtime/`, which is what the wrapper executes.
 
 A worker that dies is reported as `working` until the next reconciliation sweep (at most
 30 s), then becomes `unknown`. `unknown` is never reported as success.
@@ -334,6 +389,17 @@ Read [SECURITY.md](SECURITY.md) before installing. The short version:
   token material (`sk-ant-…`, `ghp_…`, `AKIA…`, JWTs, PEM private keys) is rejected with
   `secret_in_payload` before anything is written to the database.
 - The daemon socket is mode `0700` (`srwx------`) and reachable only by its owner.
+- **The state on disk is private.** The database carries prompts, results and session
+  identifiers, so the runner creates its state directories `0700` and `data.db` — together
+  with the `-wal` and `-shm` files SQLite keeps beside it — `0600`, whatever umask the
+  caller or the LaunchAgent brought along. An installation made before this loses its group
+  and world bits the next time the database is opened; a path owned by another account is
+  skipped rather than turned into an error.
+- **An existing worktree is only reused when git proves it belongs to the run.** Being a
+  repository root is not enough: reuse requires the same shared object store as the project
+  *and* the run's own branch checked out. A standalone repository at that path, a linked
+  worktree of another repository, or one that wandered onto a different branch is refused
+  as `worktree_failed` exactly as it stands — never deleted, reset, cleaned or repaired.
 
 ---
 
@@ -353,6 +419,12 @@ MAC_HOST=<your-mac-ssh-host> ./scripts/install_plugin_on_surface.sh
 
 Both are idempotent. Existing runs, worktrees and the database survive an update.
 
+An update provisions a **new runtime generation** and swaps the `current` symlink onto it
+only once that generation's own entrypoint has been verified, so a failed update leaves the
+previous one live and current. Workers already running keep the runtime they started from.
+Because every generation is kept, going back is a symlink swap — the exact command is
+printed in the installer's `--json` verdict under `install.rollback`.
+
 ---
 
 ## Uninstall
@@ -362,8 +434,8 @@ Both are idempotent. Existing runs, worktrees and the database survive an update
 ```
 
 Stops the LaunchAgent and moves it and the wrapper aside with a timestamp. The database,
-the worktrees and the logs are preserved on purpose — remove them by hand only if you
-really mean to. On the Hermes host, remove `~/.hermes/plugins/hermes-claude-sdk` and drop
+the worktrees, the logs and the managed runtime are preserved on purpose — remove them by
+hand only if you really mean to. On the Hermes host, remove `~/.hermes/plugins/hermes-claude-sdk` and drop
 the entry from `~/.hermes/config.yaml`.
 
 If you installed before the LaunchAgent label was renamed, set the old label first:

@@ -337,6 +337,18 @@ def test_a_ci_workflow_exists_and_is_valid_yaml() -> None:
     assert isinstance(workflow(), dict)
 
 
+def test_ci_actions_are_pinned_to_immutable_commits() -> None:
+    uses = [
+        step["uses"] for step in workflow()["jobs"]["test"]["steps"]
+        if "uses" in step
+    ]
+    assert uses, "CI has no external actions to verify"
+    for action in uses:
+        assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action), (
+            f"pin {action} to the release commit SHA, not a mutable tag"
+        )
+
+
 def test_ci_covers_the_declared_python_floor_and_the_newest_version() -> None:
     """A floor nobody tests is a floor nobody supports."""
     declared = re.search(r'requires-python = ">=([\d.]+)"',

@@ -1,11 +1,35 @@
-# hermes-claude-sdk
+<div align="center">
 
-Let **Hermes Agent** on one machine drive **Claude Code** on your Mac.
+<img src="docs/assets/readme-hero.svg" alt="hermes-claude-sdk — a Hermes agent starts, steers and inspects Claude Code runs on your Mac over ssh" width="880">
+
+### Let **Hermes Agent** on one machine drive **Claude Code** on your Mac.
+
+[![CI](https://github.com/rawprogress/hermes-claude-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/rawprogress/hermes-claude-sdk/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-2f81f7)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-2f81f7)](LICENSE)
+[![Runner](https://img.shields.io/badge/runner-macOS-2f81f7)](#requirements)
+
+**No API key** · **Your checkout is never touched** · **Nothing is deleted, reset or stashed** · **The plugin is standard library only**
+
+[Quickstart](#human-quickstart) · [The seven tools](#using-the-seven-tools) · [Architecture](#how-it-works) · [Security](#security) · [Installing with an agent](INSTALL_FOR_AGENTS.md)
+
+</div>
+
+---
+
+## Thirty seconds
 
 Hermes gets seven tools — `claude_start`, `claude_send`, `claude_status`, `claude_events`,
 `claude_list`, `claude_stop`, `claude_resume`. Hermes decides *what* should happen; Claude
 writes the code, runs the tests, the linter, the type checker and the build, and commits.
 Nobody has to sit at the Mac.
+
+| | |
+| --- | --- |
+| **1. Ask** | `claude_start(project: "demo", prompt: "…")` returns a `run_id` immediately. The Mac creates a git worktree and spawns a worker. |
+| **2. Watch** | `claude_status` gives durable state; `claude_events` streams what Claude actually did — every tool call, every result, redacted and ordered. |
+| **3. Steer** | `claude_send` drops a follow-up into the same conversation between turns. `claude_stop` ends a run without losing the worktree, the branch or the session. |
+| **4. Prove** | A run counts as done when the events show the tests Claude ran and the commit it made — never on the strength of a status alone. |
 
 There is no API key. Claude authenticates with the Claude Code login that is already on
 the Mac.
@@ -19,6 +43,11 @@ the Mac.
 
 ## How it works
 
+<img src="docs/assets/readme-architecture.svg" alt="Architecture: the Hermes host holds one plugin providing seven tools; it sends one JSON object over a fixed ssh argv and gets one JSON envelope back; the Mac runs a LaunchAgent daemon that spawns one worker per run, driving the Claude CLI inside a git worktree" width="100%">
+
+<details>
+<summary>The same diagram as text</summary>
+
 ```
 Hermes host (Linux/macOS)                    Mac (macOS, Apple Silicon or Intel)
 ┌──────────────────────────────┐             ┌──────────────────────────────────────┐
@@ -31,6 +60,8 @@ Hermes host (Linux/macOS)                    Mac (macOS, Apple Silicon or Intel)
 │   state)                     │             │          in a git worktree           │
 └──────────────────────────────┘             └──────────────────────────────────────┘
 ```
+
+</details>
 
 Four moving parts, in the order a request passes through them:
 
@@ -183,6 +214,21 @@ alone.
 
 Each tool returns a JSON string. Arguments below are exactly the tool schemas.
 
+| Tool | Use it for | Required arguments |
+| --- | --- | --- |
+| `claude_start` | Begin a run, in its own git worktree on its own branch | `project`, `prompt` |
+| `claude_send` | Queue a follow-up or an answer for a live run | `run_id`, `message` |
+| `claude_status` | Durable status, Claude session id, worktree, result or error | `run_id` |
+| `claude_events` | Ordered events: assistant text, tool activity, results | `run_id` |
+| `claude_list` | Recent and active runs | none |
+| `claude_stop` | Controlled stop that preserves worktree, branch and session | `run_id` |
+| `claude_resume` | Pick a finished run's conversation back up | `run_id`, `message` |
+
+These seven are the whole surface: one call is one run, or one question about one run.
+
+<details>
+<summary><b>Full tool reference</b> — arguments and replies for all seven, exactly as the schemas define them</summary>
+
 ### `claude_start` — begin a run
 
 ```json
@@ -296,6 +342,71 @@ cleans or stashes anything.
  "claude_session_id": "0b7e…", "worktree": "…", "branch": "hermes/3f9c1a2b",
  "base_sha": "9662e58…", "resumed": true}}
 ```
+
+</details>
+
+---
+
+## Running several agents at once
+
+A `run_id` is the whole handle. Runs never share a worktree, a branch or a conversation, so
+fanning out is a matter of keeping a list of ids — there is nothing to coordinate on the Mac.
+
+```
+claude_start(project: "api",  prompt: "…")   → r3f9…   branch hermes/3f9c1a2b
+claude_start(project: "web",  prompt: "…")   → r7b2…   branch hermes/7b21d04e
+claude_start(project: "docs", prompt: "…")   → rc41…   branch hermes/c41f8a90
+                                               one worktree each, no shared state
+
+for each run_id:
+    claude_status(run_id)                    until the status is terminal
+    claude_events(run_id, after: <cursor>)   page forward, never re-read from zero
+    claude_send(run_id, "…")                 lands between turns, in that run's conversation
+```
+
+Three things make this hold up in practice:
+
+- **One prompt, one deliverable.** Follow-ups belong in `claude_send` or `claude_resume`,
+  never in a second `claude_start` against the same work.
+- **Poll on the cursor, not the clock.** `claude_events` returns `next_cursor`; pass it back
+  as `after`. Re-reading from zero across a dozen runs is how you hit `response_too_large`.
+- **A terminal status is not a result.** Read the events. `unknown` means the worker
+  vanished — neither success nor failure — and `completed` still has to be backed by the
+  tests and the commit in the trail.
+
+Every call is one run at a time: there is no request that fans out over several runs, or
+that returns several runs' events in one round trip. Work across runs with `claude_list`
+and then one `claude_status` or `claude_events` per run, paging with `next_cursor`.
+
+Runs are rows in SQLite and workers are detached processes, so a fan-out is not tied to the
+lifetime of the Hermes session that started it. `claude_list` finds them again.
+
+---
+
+## Why not just tmux?
+
+Driving the Claude Code TUI over `tmux send-keys` is the obvious alternative, and for a lot
+of work it is the better one. The honest comparison:
+
+| | `tmux` and the Claude Code TUI | hermes-claude-sdk |
+| --- | --- | --- |
+| Reading state | Scrape the pane. Whatever scrolled past is gone, and "is it done?" is a guess about the last line | `claude_status` and `claude_events` read SQLite: ordered, cursored, durable across restarts and reboots |
+| Sending work | Keystrokes into a shared screen; two senders interleave | One JSON envelope per call, queued for delivery between turns |
+| Isolation | Whatever directory the pane is in — usually your checkout | A git worktree per run, on its own branch; your checkout is never touched |
+| Failure | A dead pane looks like a quiet one | A vanished worker becomes `unknown`, never `completed` |
+| Secrets | Anything you type is in the scrollback | Credential-shaped payloads are refused before they reach the database |
+| Several runs | One pane each, and you are the scheduler | A `run_id` each, and the daemon reconciles them |
+
+**When tmux is the better tool:**
+
+- You want to watch and interrupt continuously. This project is built for unattended runs
+  that report back, not for looking over Claude's shoulder.
+- One machine, one repository, one task. A LaunchAgent, a database and a plugin are a lot of
+  machinery to add for something a terminal already does.
+- You want permission prompts. Runs here are unattended by design and bypass them — see
+  [Security](#security) before deciding that is acceptable on your machine.
+- You need a Claude Code feature the Agent SDK does not expose. The TUI is the whole product;
+  this drives the SDK.
 
 ---
 

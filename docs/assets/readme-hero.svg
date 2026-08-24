@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360"
+     role="img" aria-labelledby="heroTitle heroDesc">
+  <title id="heroTitle">hermes-claude-sdk — Hermes plans, Claude codes</title>
+  <desc id="heroDesc">A Hermes agent on one machine starts, steers and inspects real Claude
+    Code runs on a Mac. The Hermes host holds a plugin that provides seven tools and uses the
+    standard library only; it sends one JSON envelope over ssh, or over a local transport when
+    Hermes runs on the same Mac. The Mac runs a LaunchAgent that drives Claude Code inside a
+    git worktree.</desc>
+
+  <defs>
+    <linearGradient id="heroBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B0E14"/>
+      <stop offset="1" stop-color="#111722"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="358" rx="16" fill="url(#heroBg)" stroke="#212938"/>
+
+  <circle cx="46" cy="48" r="5" fill="#7AA2F7"/>
+  <text x="62" y="53" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="15" fill="#8B94A7" letter-spacing="0.06em">hermes-claude-sdk</text>
+  <text x="1156" y="53" text-anchor="end"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="13" fill="#5A6478">MIT · macOS · Python 3.12+</text>
+
+  <text x="44" y="146" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="44" font-weight="600" fill="#E9EDF5">Hermes plans. Claude codes.</text>
+
+  <text x="44" y="188" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="18" fill="#98A1B5">Seven tools let a Hermes agent start, steer and inspect real Claude Code runs</text>
+  <text x="44" y="214" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="18" fill="#98A1B5">on your Mac — unattended, in a git worktree, with no API key.</text>
+
+  <rect x="44" y="252" width="300" height="78" rx="10" fill="#10151E" stroke="#232B39"/>
+  <text x="64" y="283" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="600" fill="#E9EDF5">Hermes host</text>
+  <text x="64" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="12.5" fill="#7D8799">plugin · 7 tools · stdlib only</text>
+
+  <text x="532" y="272" text-anchor="middle"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="12.5" fill="#7AA2F7">ssh · one JSON envelope</text>
+  <line x1="364" y1="291" x2="694" y2="291" stroke="#384456" stroke-width="1.5"/>
+  <path d="M694 285 L706 291 L694 297 Z" fill="#384456"/>
+  <text x="532" y="315" text-anchor="middle"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="11.5" fill="#5A6478">or transport: local, no ssh hop</text>
+
+  <rect x="720" y="252" width="436" height="78" rx="10" fill="#10151E" stroke="#232B39"/>
+  <text x="740" y="283" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="600" fill="#E9EDF5">your Mac</text>
+  <text x="740" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="12.5" fill="#7D8799">LaunchAgent → worker → Claude Code in a git worktree</text>
+</svg>

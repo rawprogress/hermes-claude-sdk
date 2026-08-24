@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 640" width="1200" height="640"
+     role="img" aria-labelledby="archTitle archDesc">
+  <title id="archTitle">hermes-claude-sdk architecture: Hermes host, one JSON envelope, your Mac</title>
+  <desc id="archDesc">On the left, the Hermes host holds one plugin providing seven tools:
+    claude_start, claude_send, claude_status, claude_events, claude_list, claude_stop and
+    claude_resume, with the bundled skill claude-code-orchestration beside them. The plugin
+    uses the standard library only and holds no state. In the middle, one JSON object travels
+    over a fixed argv — ssh dash o BatchMode equals yes, the host, the runner, and rpc — and
+    one JSON envelope comes back, always either ok true with a result or ok false with a stable
+    error code. With transport set to local the same argv runs without the ssh hop. On the
+    right, the Mac runs a LaunchAgent daemon that owns runs and reconciles lost workers every
+    30 seconds, spawns one detached worker per run, drives the Claude CLI through
+    ClaudeSDKClient, and works inside a git worktree on branch hermes slash short run id,
+    leaving your own checkout untouched. Along the bottom, the run lifecycle goes queued,
+    preparing, working, then completed, blocked, failed, stopped or unknown; unknown is never
+    reported as success.</desc>
+
+  <defs>
+    <linearGradient id="archBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B0E14"/>
+      <stop offset="1" stop-color="#111722"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="638" rx="16" fill="url(#archBg)" stroke="#212938"/>
+
+  <text x="40" y="50" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#5A6478" letter-spacing="0.08em">ARCHITECTURE</text>
+  <text x="1160" y="50" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#5A6478">hermes-claude-sdk</text>
+
+  <rect x="40" y="88" width="420" height="380" rx="12" fill="#0E131B" stroke="#1E2532"/>
+  <text x="64" y="126" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="600" fill="#E9EDF5">Hermes host</text>
+  <text x="64" y="147" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#6E7889">Linux or macOS</text>
+  <line x1="64" y1="166" x2="436" y2="166" stroke="#1E2532"/>
+  <text x="64" y="191" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#7AA2F7" letter-spacing="0.05em">one plugin · seven tools</text>
+  <rect x="64" y="202" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="76" y="222" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_start</text>
+  <rect x="252" y="202" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="264" y="222" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_send</text>
+  <rect x="64" y="240" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="76" y="260" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_status</text>
+  <rect x="252" y="240" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="264" y="260" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_events</text>
+  <rect x="64" y="278" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="76" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_list</text>
+  <rect x="252" y="278" width="176" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="264" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_stop</text>
+  <rect x="64" y="316" width="364" height="30" rx="6" fill="#141B26" stroke="#222B3A"/>
+  <text x="76" y="336" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#AEB8CC">claude_resume</text>
+  <text x="64" y="390" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#7D8799">bundled skill · claude-code-orchestration</text>
+  <text x="64" y="424" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5F6979">standard library only · holds no state</text>
+
+  <text x="600" y="196" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#6E7889">one JSON object in</text>
+  <text x="600" y="228" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#7AA2F7">ssh -o BatchMode=yes &lt;host&gt;</text>
+  <text x="600" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#7AA2F7">&lt;runner&gt; rpc</text>
+  <line x1="478" y1="274" x2="716" y2="274" stroke="#384456" stroke-width="1.5"/>
+  <path d="M716 268 L728 274 L716 280 Z" fill="#384456"/>
+  <text x="600" y="302" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#6E7889">one JSON envelope out</text>
+  <text x="600" y="328" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#7FD1A0">always ok true with a result</text>
+  <text x="600" y="346" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#D9A05B">or ok false with a stable code</text>
+  <line x1="510" y1="382" x2="690" y2="382" stroke="#1E2532"/>
+  <text x="600" y="410" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#7AA2F7">transport: local</text>
+  <text x="600" y="430" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#5F6979">same fixed argv, no ssh hop</text>
+
+  <rect x="740" y="88" width="420" height="380" rx="12" fill="#0E131B" stroke="#1E2532"/>
+  <text x="764" y="126" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="600" fill="#E9EDF5">your Mac</text>
+  <text x="764" y="147" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#6E7889">macOS · Apple Silicon or Intel</text>
+  <line x1="764" y1="166" x2="1136" y2="166" stroke="#1E2532"/>
+  <rect x="764" y="180" width="372" height="58" rx="8" fill="#10151E" stroke="#222B3A"/>
+  <text x="782" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#E3E8F2">LaunchAgent · daemon</text>
+  <text x="782" y="224" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#6E7889">owns runs · reconciles lost workers every 30 s</text>
+  <path d="M944 242 L956 250 L968 242 Z" fill="#2E3848"/>
+  <rect x="764" y="254" width="372" height="58" rx="8" fill="#10151E" stroke="#222B3A"/>
+  <text x="782" y="278" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#E3E8F2">one worker per run</text>
+  <text x="782" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#6E7889">spawned detached · pid recorded and proven</text>
+  <path d="M944 316 L956 324 L968 316 Z" fill="#2E3848"/>
+  <rect x="764" y="328" width="372" height="58" rx="8" fill="#10151E" stroke="#222B3A"/>
+  <text x="782" y="352" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#E3E8F2">ClaudeSDKClient → claude CLI</text>
+  <text x="782" y="372" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#6E7889">runs unattended · loads your Claude settings</text>
+  <path d="M944 390 L956 398 L968 390 Z" fill="#2E3848"/>
+  <rect x="764" y="402" width="372" height="58" rx="8" fill="#10151E" stroke="#222B3A"/>
+  <text x="782" y="426" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#E3E8F2">git worktree</text>
+  <text x="782" y="446" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#6E7889">branch hermes/&lt;short-run-id&gt; · not your checkout</text>
+
+  <line x1="40" y1="512" x2="1160" y2="512" stroke="#1A2029"/>
+  <text x="40" y="544" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5A6478" letter-spacing="0.08em">RUN LIFECYCLE</text>
+  <text x="40" y="580" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" fill="#98A1B5">queued <tspan fill="#3E4859">→</tspan> preparing <tspan fill="#3E4859">→</tspan> working <tspan fill="#3E4859">→</tspan> <tspan fill="#7FD1A0">completed</tspan> <tspan fill="#3E4859">|</tspan> blocked <tspan fill="#3E4859">|</tspan> <tspan fill="#D98080">failed</tspan> <tspan fill="#3E4859">|</tspan> stopped <tspan fill="#3E4859">|</tspan> <tspan fill="#D9A05B">unknown</tspan></text>
+  <text x="40" y="606" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5F6979">a worker that vanished becomes unknown — never completed, and never reported as success</text>
+</svg>

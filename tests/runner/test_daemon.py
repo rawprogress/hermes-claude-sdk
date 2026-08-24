@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -460,3 +463,221 @@ def test_a_schema_default_timestamp_still_grants_the_grace_period(
     assert "." in stamp, "the schema default is expected to be fractional"
     assert daemon.Daemon(paths, spawner=_NullSpawner()).reconcile() == []
     assert store.get_run("rdefault1")["status"] == models.STATUS_PREPARING
+
+
+# ── stop terminates the whole worker process group ─────────────────────────
+
+# A plain sleeper: it is not killed by its parent's death, so surviving one is
+# proof that a signal reached it directly rather than by orphaning.
+_SLEEP_SECONDS = 45
+
+
+def _sleeper_argv(*extra: str) -> list[str]:
+    return [sys.executable, "-c", f"import time;time.sleep({_SLEEP_SECONDS})", *extra]
+
+
+def _write_script(tmp_path: Path, name: str, body: str) -> str:
+    script = tmp_path / name
+    script.write_text(textwrap.dedent(body))
+    return str(script)
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - alive but owned elsewhere
+        return True
+    return True
+
+
+def _wait_until_gone(pid: int, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _running(pid):
+            return True
+        time.sleep(0.02)
+    return not _running(pid)
+
+
+def _kill_group(pid: int) -> None:
+    """Best-effort cleanup of a whole test session, leader included."""
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_signal_stop_terminates_the_whole_worker_process_group(
+    paths: RunnerPaths, tmp_path: Path
+) -> None:
+    """A stop must reach the worker's children, not just the worker pid.
+
+    The real worker spawns the Claude CLI; killing only the worker would leave
+    that subprocess running against the same worktree.
+    """
+    script = _write_script(tmp_path, "worker_with_child.py", f"""
+        import subprocess, sys, time
+        grandchild = subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep({_SLEEP_SECONDS})"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(grandchild.pid, flush=True)
+        time.sleep({_SLEEP_SECONDS})
+    """)
+    spawner = daemon.ProcessSpawner(paths)
+    worker = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, script, daemon.WORKER_MARKER, "--run-id", "rtree0001"],
+        stdout=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    started = time.time()
+    grandchild_pid = int(worker.stdout.readline().strip())
+    try:
+        assert spawner.signal_stop(worker.pid, started, run_id="rtree0001") is True
+        assert worker.wait(timeout=10) is not None
+        assert _wait_until_gone(grandchild_pid), (
+            "the worker's child outlived the stop; only the worker pid was signalled"
+        )
+    finally:
+        _kill_group(worker.pid)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            worker.wait(timeout=5)
+
+
+def test_signal_stop_leaves_an_unrelated_process_alone(
+    paths: RunnerPaths, tmp_path: Path
+) -> None:
+    """Only the run's own session is signalled; a bystander keeps running."""
+    spawner = daemon.ProcessSpawner(paths)
+    bystander = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _sleeper_argv("hermes-test-bystander"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    worker = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _sleeper_argv(daemon.WORKER_MARKER, "--run-id", "rsafe0001"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    started = time.time()
+    try:
+        # The bystander is alive but is not this run's worker: fail closed.
+        assert spawner.signal_stop(bystander.pid, started, run_id="rsafe0001") is False
+
+        assert spawner.signal_stop(worker.pid, started, run_id="rsafe0001") is True
+        assert worker.wait(timeout=10) is not None
+        assert bystander.poll() is None, "an unrelated process was caught by the stop"
+        assert _running(bystander.pid)
+    finally:
+        for proc in (bystander, worker):
+            _kill_group(proc.pid)
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                proc.wait(timeout=5)
+
+
+def test_signal_stop_is_safe_to_repeat(paths: RunnerPaths) -> None:
+    """A second stop must not raise and must not signal the recycled pid."""
+    spawner = daemon.ProcessSpawner(paths)
+    worker = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _sleeper_argv(daemon.WORKER_MARKER, "--run-id", "rtwice001"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    started = time.time()
+    try:
+        assert spawner.signal_stop(worker.pid, started, run_id="rtwice001") is True
+        assert worker.wait(timeout=10) is not None  # reaped: the pid is free again
+        # Identity can no longer be proven, so nothing is signalled.
+        assert spawner.signal_stop(worker.pid, started, run_id="rtwice001") is False
+        assert spawner.signal_stop(worker.pid, started, run_id="rtwice001") is False
+    finally:
+        _kill_group(worker.pid)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            worker.wait(timeout=5)
+
+
+def test_signal_stop_refuses_a_group_the_worker_does_not_lead(
+    paths: RunnerPaths, tmp_path: Path
+) -> None:
+    """A worker that does not lead its group falls back to a pid-only signal.
+
+    Signalling a group the run does not own would hit strangers that merely
+    share it — including, in the worst case, the daemon itself.
+    """
+    script = _write_script(tmp_path, "shared_group.py", f"""
+        import subprocess, sys, time
+
+        def sleeper(*extra):
+            return [sys.executable, "-c", "import time;time.sleep({_SLEEP_SECONDS})", *extra]
+
+        quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+        marked = subprocess.Popen(
+            sleeper("{daemon.WORKER_MARKER}", "--run-id", "rshared01"), **quiet)
+        neighbour = subprocess.Popen(sleeper("hermes-test-neighbour"), **quiet)
+        print(marked.pid, neighbour.pid, flush=True)
+        end = time.time() + {_SLEEP_SECONDS}
+        while time.time() < end:
+            marked.poll()      # reap, so a dead child frees its pid
+            neighbour.poll()
+            time.sleep(0.05)
+    """)
+    spawner = daemon.ProcessSpawner(paths)
+    leader = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, script],
+        stdout=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    marked_pid, neighbour_pid = (int(p) for p in leader.stdout.readline().split())
+    started = time.time()
+    try:
+        assert os.getpgid(marked_pid) == leader.pid != marked_pid, "setup: shared group"
+
+        assert spawner.signal_stop(marked_pid, started, run_id="rshared01") is True
+        assert _wait_until_gone(marked_pid)
+        assert _running(neighbour_pid), "a group member that is not the worker was signalled"
+        assert leader.poll() is None, "the group leader was signalled"
+    finally:
+        _kill_group(leader.pid)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            leader.wait(timeout=5)
+
+
+def test_worker_process_group_only_accepts_a_session_leading_worker(
+    paths: RunnerPaths,
+) -> None:
+    """The group is signalled only when the worker provably owns it."""
+    worker = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _sleeper_argv(daemon.WORKER_MARKER, "--run-id", "rgroup001"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        assert daemon._worker_process_group(worker.pid) == worker.pid
+    finally:
+        _kill_group(worker.pid)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            worker.wait(timeout=5)
+
+    assert daemon._worker_process_group(999_999) is None
+    assert daemon._worker_process_group(0) is None
+    # Our own group must never be a stop target: that group holds the daemon.
+    assert daemon._worker_process_group(os.getpgid(0)) is None
+
+
+def test_spawn_keeps_every_worker_in_its_own_session(
+    paths: RunnerPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detached workers survive a daemon restart — and own the group a stop kills."""
+    seen: dict[str, object] = {}
+
+    class _RecordingPopen:
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            seen["argv"] = argv
+            seen.update(kwargs)
+            self.pid = 4242
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", _RecordingPopen)
+    pid, started_at = daemon.ProcessSpawner(paths).spawn("rspawn001")
+    assert (pid, started_at > 0) == (4242, True)
+    assert seen["start_new_session"] is True

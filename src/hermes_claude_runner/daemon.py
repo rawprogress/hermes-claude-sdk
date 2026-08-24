@@ -109,6 +109,30 @@ def _process_command(pid: int) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
+def _worker_process_group(pid: int) -> int | None:
+    """The process group *pid* leads, or ``None`` when it provably leads none.
+
+    ``spawn`` starts every worker with ``start_new_session=True``, so a genuine
+    worker leads both its session and its group: ``sid == pgid == pid``. Any
+    other shape means the group holds processes this run does not own, so it is
+    never signalled — a pid that merely shares a group with strangers, or the
+    daemon's own group, falls back to a single-pid signal.
+    """
+    if pid <= 0:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+        sid = os.getsid(pid)
+    except (OSError, ValueError):
+        # Gone, or owned by somebody else: we cannot prove what the group holds.
+        return None
+    if pgid != pid or sid != pid:
+        return None
+    if pgid == os.getpgid(0):  # our own group: signalling it would stop the daemon
+        return None
+    return pgid
+
+
 class ProcessSpawner:
     """Launches ``hermes-claude-runner worker`` in a detached process session."""
 
@@ -185,14 +209,33 @@ class ProcessSpawner:
         started_at: float | None,
         run_id: str | None = None,
     ) -> bool:
-        """SIGTERM the run's worker so a stop lands without waiting for a poll.
+        """SIGTERM the run's whole worker session so a stop lands completely.
 
-        Identity is proven first: a recycled pid must never be signalled.
+        The worker spawns the Claude CLI as its own child; signalling only the
+        worker pid would leave that subprocess alive against the run's
+        worktree. The group is therefore the target — but only the one the
+        worker provably leads, and only once identity is proven, so a recycled
+        pid or a group full of strangers is never signalled.
         """
+        if not pid or pid <= 0:
+            return False
+        pid = int(pid)
+        # Resolved before the identity proof so that proof is the last thing to
+        # happen before the signal, leaving the narrowest possible window.
+        pgid = _worker_process_group(pid)
         if not self.is_alive(pid, started_at, run_id):
             return False
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass  # the group went away; the single-pid attempt below decides
+            else:
+                logger.info("sent SIGTERM to worker process group %s for run %s", pgid, run_id)
+                return True
         try:
-            os.kill(int(pid), signal.SIGTERM)  # type: ignore[arg-type]
+            os.kill(pid, signal.SIGTERM)
         except OSError:
             return False
         logger.info("sent SIGTERM to worker pid %s for run %s", pid, run_id)

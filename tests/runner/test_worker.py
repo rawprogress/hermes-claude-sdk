@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import ProcessError
 
 from hermes_claude_runner import worker
 from hermes_claude_runner.config import RunnerPaths
@@ -659,3 +660,131 @@ async def test_a_stopped_turn_without_a_result_is_still_stopped(
 
     status, _ = await run(store, paths, run_id, [[stop_then_wait, fakes.say("unsent")]])
     assert status == "stopped"
+
+
+# ── a stop that terminates the CLI mid-turn ────────────────────────────────
+
+def _cli_killed_by_sigterm() -> ProcessError:
+    """What the SDK raises once a stop's SIGTERM reaches the Claude CLI.
+
+    A controlled stop signals the worker's whole process group, so the CLI is
+    torn down under the SDK and ``receive_response`` raises instead of ending
+    the turn cleanly.
+    """
+    return ProcessError("Command failed with exit code -15", exit_code=-15)
+
+
+async def test_a_cli_killed_by_the_stop_ends_the_run_stopped(store, paths, tmp_path) -> None:
+    run_id = seed(store, paths, tmp_path)
+
+    async def stop_then_die(_client):
+        store.request_stop(run_id)
+        raise _cli_killed_by_sigterm()
+
+    status, _ = await run(store, paths, run_id, [[fakes.init("sess-9"), stop_then_die]])
+
+    record = store.get_run(run_id)
+    assert status == "stopped"
+    assert record["status"] == "stopped"
+    assert record["error"] is None, "a requested stop is not a failure"
+    assert record["result"] is None, "a stop must never invent a result"
+    assert record["claude_session_id"] == "sess-9", "session must survive a stop"
+    stopped = next(e for e in store.get_events(run_id, limit=500) if e["kind"] == "stopped")
+    assert stopped["payload"]["preserved_worktree"] == record["worktree"]
+    assert Path(record["worktree"]).is_dir()
+
+
+async def test_a_cli_killed_by_the_stop_keeps_the_sdk_error_in_the_trail(
+    store, paths, tmp_path
+) -> None:
+    """The run is stopped, but why the turn ended abruptly stays on record."""
+    run_id = seed(store, paths, tmp_path)
+
+    async def stop_then_die(_client):
+        store.request_stop(run_id)
+        raise _cli_killed_by_sigterm()
+
+    await run(store, paths, run_id, [[stop_then_die]])
+
+    details = [json.dumps(e["payload"]) for e in store.get_events(run_id, limit=500)]
+    assert any("exit code -15" in d for d in details), "the SDK error was swallowed"
+
+
+async def test_an_external_stop_that_kills_the_cli_ends_the_run_stopped(
+    store, paths, tmp_path
+) -> None:
+    """The signal path: the stop flag may never have reached the database."""
+    run_id = seed(store, paths, tmp_path)
+    event = threading.Event()
+
+    async def signal_then_die(_client):
+        event.set()  # what the SIGTERM handler does, without touching the database
+        raise _cli_killed_by_sigterm()
+
+    status, _ = await run(store, paths, run_id, [[signal_then_die]], external_stop=event)
+
+    assert status == "stopped"
+    assert store.get_run(run_id)["status"] == "stopped"
+    assert "stopped" in kinds(store, run_id)
+
+
+async def test_a_cli_that_dies_without_a_stop_still_fails(store, paths, tmp_path) -> None:
+    """Without a stop on record the very same SDK error is a genuine failure."""
+    run_id = seed(store, paths, tmp_path)
+
+    async def die(_client):
+        raise _cli_killed_by_sigterm()
+
+    status, _ = await run(store, paths, run_id, [[die]])
+
+    record = store.get_run(run_id)
+    assert status == "failed"
+    assert record["status"] == "failed"
+    assert record["result"] is None
+    assert "ProcessError" in (record["error"] or "")
+    assert "stopped" not in kinds(store, run_id)
+
+
+async def test_a_cancelled_worker_with_a_stop_on_record_is_stopped(
+    store, paths, tmp_path
+) -> None:
+    """Cancellation during a stop is that stop landing, not a lost worker."""
+    run_id = seed(store, paths, tmp_path)
+    event = threading.Event()
+
+    async def signal_then_cancel(_client):
+        event.set()
+        raise asyncio.CancelledError
+
+    status, _ = await run(store, paths, run_id, [[signal_then_cancel]], external_stop=event)
+
+    assert status == "stopped"
+    assert store.get_run(run_id)["status"] == "stopped"
+    assert "stopped" in kinds(store, run_id)
+
+
+async def test_a_cancelled_worker_without_a_stop_is_still_unknown(
+    store, paths, tmp_path
+) -> None:
+    run_id = seed(store, paths, tmp_path)
+
+    async def cancel(_client):
+        raise asyncio.CancelledError
+
+    status, _ = await run(store, paths, run_id, [[cancel]])
+
+    assert status == "unknown"
+    assert store.get_run(run_id)["status"] == "unknown"
+
+
+async def test_a_store_that_breaks_mid_failure_never_invents_a_stop(paths) -> None:
+    """The store may be exactly what failed; then no stop is on record."""
+
+    class BrokenStore:
+        def get_run(self, run_id: str) -> dict:
+            raise RuntimeError("the store is gone")
+
+    session = worker._Session("rtest0001", BrokenStore(), 0.005)
+    assert session.stop_on_record() is False
+    session.external_stop.set()
+    assert session.stop_on_record() is True

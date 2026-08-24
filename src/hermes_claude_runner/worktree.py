@@ -136,32 +136,65 @@ def worktree_path(paths: RunnerPaths, project: Path, run_id: str) -> Path:
     return paths.worktrees_root / project.name / run_id
 
 
-def _is_worktree_of(target: Path, project: Path) -> bool:
+def _refuse_unless_reusable(target: Path, project: Path, branch: str) -> None:
+    """Raise unless git proves *target* is this run's own worktree.
+
+    Being a repository root is not enough: a standalone repository that was
+    initialised at that path, or a linked worktree of a *different* repository,
+    would look identical from the outside while commits landed somewhere the
+    run never meant to touch. Reuse therefore needs two proofs from git — the
+    same shared object store as *project*, and *branch* checked out — and a
+    target that fails either one is refused as it stands, never repaired.
+    """
     if not (target / ".git").exists():
-        return False
+        raise RunnerError(
+            "worktree_failed", f"{target} already exists and is not a git worktree"
+        )
     try:
-        top = _run_git(git_argv(target, "rev-parse", "--show-toplevel"))
-    except RunnerError:
-        return False
-    return Path(top).resolve() == target.resolve()
+        top_level = Path(_run_git(git_argv(target, "rev-parse", "--show-toplevel"))).resolve()
+        common = git_common_dir(target).resolve()
+        current = _run_git(git_argv(target, "rev-parse", "--abbrev-ref", "HEAD"))
+    except RunnerError as exc:
+        # ``not_a_git_repository`` is reserved for the *project* argument;
+        # from here a failed probe only ever condemns the target.
+        raise RunnerError(
+            "worktree_failed",
+            f"{target} already exists and is not a git worktree: {exc.detail}",
+        ) from exc
+
+    if top_level != target.resolve():
+        raise RunnerError(
+            "worktree_failed", f"{target} already exists and is not a git worktree"
+        )
+    expected_common = git_common_dir(project).resolve()
+    if common != expected_common:
+        raise RunnerError(
+            "worktree_failed",
+            f"{target} already exists but belongs to a different repository: "
+            f"its git directory is {common}, expected {expected_common}",
+        )
+    if current != branch:
+        seen = "a detached HEAD" if current == "HEAD" else f"branch {current!r}"
+        raise RunnerError(
+            "worktree_failed",
+            f"{target} already exists on {seen}, expected branch {branch!r}",
+        )
 
 
 def create_worktree(paths: RunnerPaths, project: Path, run_id: str) -> WorktreeInfo:
     """Create ``<worktrees_root>/<repo>/<run-id>`` on branch ``hermes/<short>``.
 
-    Re-running for the same run id reuses the existing worktree untouched;
-    an existing directory that is not a worktree is an error, never a reset.
+    Re-running for the same run id reuses the existing worktree untouched, but
+    only once git has confirmed it belongs to *project* and sits on the run's
+    branch. Anything else is an error, never a reset.
     """
     target = worktree_path(paths, project, run_id)
     branch = models.branch_for_run(run_id)
     base = head_sha(project)
 
     if target.exists():
-        if _is_worktree_of(target, project):
-            return WorktreeInfo(path=target, branch=branch, base_sha=base, mode="worktree")
-        raise RunnerError(
-            "worktree_failed", f"{target} already exists and is not a git worktree"
-        )
+        _refuse_unless_reusable(target, project, branch)
+        return WorktreeInfo(path=target, branch=branch, base_sha=base, mode="worktree")
 
     target.parent.mkdir(parents=True, exist_ok=True)
     _run_git(worktree_add_argv(project, target, branch, base))

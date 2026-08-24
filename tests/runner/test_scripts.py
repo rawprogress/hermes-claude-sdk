@@ -30,6 +30,13 @@ BOOTSTRAP_NEVER_SETTLES = 10**6
 # behind it, or the next machine that is a little slower has no reserve left.
 OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT = 6
 
+# The waits between bootstrap attempts, in order, as strings because that is
+# what `sleep` is handed. The first attempt is not in here: it is immediate.
+# Written out rather than computed, so a schedule that quietly grows, shrinks
+# or reorders has to be restated here to pass.
+BOOTSTRAP_BACKOFF = ["0.2", "0.5", "1", "2", "4", "4", "4"]
+BOOTSTRAP_ATTEMPTS = len(BOOTSTRAP_BACKOFF) + 1
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "scripts"
 NAMES = ("install_runner.sh", "install_plugin_on_surface.sh", "uninstall.sh")
@@ -154,7 +161,15 @@ def _sandbox(
         "fi\n"
         "exit 0\n"
     )
-    for stub in ("uv", "launchctl"):
+    # Recording, and deliberately not sleeping: what is under test is which
+    # waits the installer asks for, and a stub that honoured them would make
+    # the suite pay for a backoff it is only reading.
+    (bin_dir / "sleep").write_text(
+        "#!/bin/sh\n"
+        f'printf "sleep %s\\n" "$*" >> {shlex.quote(str(log))}\n'
+        "exit 0\n"
+    )
+    for stub in ("uv", "launchctl", "sleep"):
         (bin_dir / stub).chmod(0o755)
 
     home = tmp_path / "home"
@@ -298,6 +313,40 @@ def _launchctl_calls(log: Path) -> list[str]:
     return [line for line in log.read_text().splitlines() if line.startswith("launchctl ")]
 
 
+def _bootstrap_schedule(log: Path) -> list[list[str]]:
+    """The waits taken before each ``launchctl bootstrap``, attempt by attempt.
+
+    Read from the interleaved call log rather than from the installer's prose,
+    so the assertion sees what the installer *did*: one list per attempt, empty
+    when that attempt was immediate.
+    """
+    schedule: list[list[str]] = []
+    waited: list[str] = []
+    for line in log.read_text().splitlines():
+        if line.startswith("sleep "):
+            waited.append(line.split(maxsplit=1)[1])
+        elif line.startswith("launchctl bootstrap"):
+            schedule.append(waited)
+            waited = []
+    return schedule
+
+
+def test_installer_waits_for_nothing_when_the_bootstrap_takes_first_time(
+    tmp_path: Path,
+) -> None:
+    """The common install must not pay for the race it does not run into."""
+    env, log = _sandbox(tmp_path)
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["ok"] is True   # still exactly one object
+
+    assert _bootstrap_schedule(log) == [[]], "one attempt, taken immediately"
+    assert "sleep " not in log.read_text(), (
+        "a bootstrap that worked leaves the installer nothing to wait for"
+    )
+
+
 def test_installer_retries_a_bootstrap_that_races_the_teardown(tmp_path: Path) -> None:
     """`launchctl bootout` returns before the label leaves the domain.
 
@@ -327,9 +376,10 @@ def test_installer_retries_a_bootstrap_that_races_the_teardown(tmp_path: Path) -
 def test_installer_survives_the_slowest_teardown_seen_on_a_real_mac(tmp_path: Path) -> None:
     """The smoke that failed five attempts and loaded on the sixth.
 
-    Pinned by attempt number rather than by seconds: the schedule may be
-    stretched, but the machine that needed six bootstraps has to keep
-    installing.
+    Pinned to the rung *and* to the waits that lead up to it: the machine that
+    needed six bootstraps has to keep installing, and it has to get there by
+    walking the documented ladder rather than on a schedule that merely
+    happens to arrive in time.
     """
     env, log = _sandbox(
         tmp_path, bootstrap_failures=OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT - 1,
@@ -347,6 +397,39 @@ def test_installer_survives_the_slowest_teardown_seen_on_a_real_mac(tmp_path: Pa
     kickstart = next(i for i, line in enumerate(calls) if line.startswith("launchctl kickstart"))
     assert kickstart > attempts[-1], "the service that finally loaded must still be kickstarted"
 
+    # Rung 6 is reached by walking the ladder from the top, not by one long
+    # wait: a schedule that got there sooner or later would not be this one.
+    waited = BOOTSTRAP_BACKOFF[:OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT - 1]
+    assert _bootstrap_schedule(log) == [[], *([w] for w in waited)]
+
+
+def test_installer_loads_on_the_last_rung_of_the_ladder(tmp_path: Path) -> None:
+    """A teardown that settles only in time for the eighth attempt still installs.
+
+    The last rung is the one with no attempt behind it to cover for it, so a
+    ladder trimmed by one turns this install into a hard failure while every
+    shorter race still passes. Deliberately kept apart from the never-settles
+    case: both walk the whole backoff, and only this one may come back green.
+    """
+    env, log = _sandbox(tmp_path, bootstrap_failures=BOOTSTRAP_ATTEMPTS - 1)
+    completed = _run_installer(env, "--json", "--skip-verify")
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)   # still exactly one object
+    assert payload["ok"] is True
+    assert payload["health"]["ok"] is True
+
+    calls = _launchctl_calls(log)
+    attempts = [i for i, line in enumerate(calls) if line.startswith("launchctl bootstrap")]
+    assert len(attempts) == BOOTSTRAP_ATTEMPTS, calls
+    kickstart = next(i for i, line in enumerate(calls) if line.startswith("launchctl kickstart"))
+    assert kickstart > attempts[-1], "the service that finally loaded must still be kickstarted"
+
+    # Success on the final rung has to be reached by walking the whole ladder,
+    # not by a schedule that arrives at an eighth attempt some other way. Read
+    # off the calls, like the failing case, so the two are held to one contract.
+    assert _bootstrap_schedule(log) == [[], *([w] for w in BOOTSTRAP_BACKOFF)]
+
 
 def test_installer_keeps_a_bootstrap_that_never_settles_fatal(tmp_path: Path) -> None:
     """Retrying must not turn a service that never loaded into a quiet success."""
@@ -362,10 +445,17 @@ def test_installer_keeps_a_bootstrap_that_never_settles_fatal(tmp_path: Path) ->
 
     calls = _launchctl_calls(log)
     attempts = sum(line.startswith("launchctl bootstrap") for line in calls)
+    assert attempts == 8, "the budget is eight attempts, no more and no fewer"
+    assert attempts == BOOTSTRAP_ATTEMPTS
     assert attempts > OBSERVED_SLOWEST_BOOTSTRAP_ATTEMPT, (
         "a schedule that gives up on the slowest teardown already observed "
         "keeps no reserve for the machine that is a little slower"
     )
+
+    # The whole ladder, walked to the end: first attempt immediate, then every
+    # wait in the documented order. Read off the calls, so stretching, padding
+    # or reordering the schedule fails here rather than in a comment.
+    assert _bootstrap_schedule(log) == [[], *([w] for w in BOOTSTRAP_BACKOFF)]
     assert not any(line.startswith("launchctl kickstart") for line in calls), (
         "kickstarting a service that was never bootstrapped hides the real failure"
     )

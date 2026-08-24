@@ -1,4 +1,7 @@
-"""Handlers and the ssh transport.
+"""Handlers and the two transports.
+
+``transport: ssh`` reaches a Mac over ssh; ``transport: local`` runs the same
+runner on this machine. Both build a fixed argv and never go through a shell.
 
 Standard library only: the Hermes venv must not grow a dependency for this.
 Every handler returns a JSON string, including on every failure path, so the
@@ -9,11 +12,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+SSH_TRANSPORT = "ssh"
+LOCAL_TRANSPORT = "local"
+# ssh is the only transport this plugin had, so it stays the default: an
+# install that predates the setting must keep working without being edited.
+DEFAULT_TRANSPORT = SSH_TRANSPORT
 
 DEFAULT_SSH_HOST = "macbook"
 # Home-relative on purpose: ssh hands the command to the Mac's login shell,
@@ -25,8 +35,15 @@ DEFAULT_REMOTE_COMMAND = "~/.local/bin/hermes-claude-runner"
 # outlast both — otherwise a run that really started comes back as ssh_timeout.
 # This is deliberately longer than the runner's own 180s socket timeout, not
 # equal to it: the outer wait has to survive the inner one expiring.
+# Running on the Mac itself removes the ssh hop, not the runner's inline work:
+# `git worktree add` and the daemon socket wait are unchanged, so both
+# transports share this floor.
 MIN_TIMEOUT_SECONDS = 240
 DEFAULT_TIMEOUT_SECONDS = 240
+# The same wrapper, reached without ssh. It is a separate setting so that
+# switching transports never silently reinterprets a path that was written for
+# another machine — and so the ssh settings keep meaning exactly what they say.
+DEFAULT_LOCAL_COMMAND = "~/.local/bin/hermes-claude-runner"
 
 # ssh reads a destination starting with "-" as an option, so a hostile setting
 # could smuggle in -oProxyCommand. Both settings are matched against strict
@@ -35,12 +52,25 @@ _SSH_HOST_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._@:-]*\Z")
 # "~/" (the runner's own account) or an absolute path. "~other/" is refused:
 # the remote shell would resolve it against a different account's home.
 _REMOTE_COMMAND_RE = re.compile(r"\A(~/|/)[A-Za-z0-9._+/-]+\Z")
+# The local command is held to exactly the same shape: it also becomes argv[0]
+# of a command nobody quotes, so a space or a metacharacter has no business in
+# it either. Sharing the pattern is what keeps the two guards from drifting.
+_LOCAL_COMMAND_RE = _REMOTE_COMMAND_RE
+# Nothing but the two names this plugin implements; anything else is a typo or
+# an attempt to reach a third code path that does not exist.
+_TRANSPORT_RE = re.compile(r"\A(ssh|local)\Z")
 
-# Reaching the Mac is the one step a fresh install has to get right by hand,
-# so every transport failure names the settings that decide it.
-_HINT = (
+# Reaching the runner is the one step a fresh install has to get right by hand,
+# so every transport failure names the settings that decide it. The hints are
+# per transport: pointing a local failure at ssh_host would send the reader to
+# a setting that had no part in it.
+_SSH_HINT = (
     "Check `ssh <host> true` from this machine and the plugin's ssh_host / "
     "remote_command settings in ~/.hermes/config.yaml"
+)
+_LOCAL_HINT = (
+    "Check `hermes-claude-runner doctor` on this machine and the plugin's "
+    "transport / local_command settings in ~/.hermes/config.yaml"
 )
 
 MAX_OUTPUT_CHARS = 24_000
@@ -81,14 +111,32 @@ def _setting(key: str, default: Any, kind: type, pattern: re.Pattern[str] | None
     return value
 
 
+def transport() -> str:
+    """The configured transport; anything else falls back to ssh."""
+    return _setting("transport", DEFAULT_TRANSPORT, str, _TRANSPORT_RE)
+
+
 def ssh_argv() -> list[str]:
-    """The one command shape this plugin is allowed to run."""
+    """The one command shape the ssh transport is allowed to run."""
     return [
         "ssh", "-o", "BatchMode=yes",
         _setting("ssh_host", DEFAULT_SSH_HOST, str, _SSH_HOST_RE),
         _setting("remote_command", DEFAULT_REMOTE_COMMAND, str, _REMOTE_COMMAND_RE),
         "rpc",
     ]
+
+
+def local_argv() -> list[str]:
+    """The one command shape the local transport is allowed to run.
+
+    No shell is involved, so nothing else would expand the tilde: the plugin
+    resolves it here, against the account Hermes itself runs as. Validation has
+    already pinned the value to "~/..." or "/...", so the result is absolute
+    and the executable is never looked up on PATH — unless the home directory
+    cannot be resolved at all, which ``call_runner`` refuses outright.
+    """
+    command = _setting("local_command", DEFAULT_LOCAL_COMMAND, str, _LOCAL_COMMAND_RE)
+    return [os.path.expanduser(command), "rpc"]
 
 
 def _envelope(code: str, detail: str) -> dict[str, Any]:
@@ -171,8 +219,26 @@ def _shrink_events(payload: dict[str, Any], after: int) -> dict[str, Any]:
 
 
 def call_runner(request: dict[str, Any]) -> dict[str, Any]:
-    """Send one request over ssh and return the runner's envelope."""
-    argv = ssh_argv()
+    """Send one request to the runner and return its envelope."""
+    local = transport() == LOCAL_TRANSPORT
+    argv = local_argv() if local else ssh_argv()
+    # The failure codes are per transport so an error never names a setting
+    # that had no part in it. The envelope shape and the timeout are shared.
+    hint = _LOCAL_HINT if local else _SSH_HINT
+    # The ssh destination is argv[3]; the local runner is argv[0]. Deciding this
+    # before the call keeps the handlers below free of transport indexing.
+    target = argv[0] if local else argv[3]
+
+    if local and not os.path.isabs(target):
+        # expanduser gives up by returning its input unchanged. A relative
+        # argv[0] would then be resolved against whatever directory Hermes
+        # happens to run in, so this fails closed instead of guessing.
+        return _envelope(
+            "local_unavailable",
+            f"cannot resolve {target} to an absolute path; the home directory of "
+            f"this account is unknown. {hint}",
+        )
+
     # A shorter configured timeout would only ever hide a live run behind a
     # misleading error, so the floor wins.
     timeout = max(
@@ -188,8 +254,15 @@ def call_runner(request: dict[str, Any]) -> dict[str, Any]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return _envelope("ssh_timeout", f"no answer from {argv[3]} within {timeout}s. {_HINT}")
+        return _envelope(
+            "local_timeout" if local else "ssh_timeout",
+            f"no answer from {target} within {timeout}s. {hint}",
+        )
     except FileNotFoundError:
+        if local:
+            return _envelope(
+                "local_unavailable", f"no runner executable at {target}. {hint}"
+            )
         return _envelope("ssh_unavailable", "the ssh binary was not found on this machine")
     except Exception as exc:  # noqa: BLE001 - the model must still get JSON
         logger.exception("claude_sdk transport failed")
@@ -197,8 +270,9 @@ def call_runner(request: dict[str, Any]) -> dict[str, Any]:
 
     stdout = (completed.stdout or "").strip()
     if completed.returncode != 0 and not stdout:
-        detail = (completed.stderr or "").strip() or f"ssh exited {completed.returncode}"
-        return _envelope("ssh_failed", f"{detail}. {_HINT}")
+        exited = "the runner exited" if local else "ssh exited"
+        detail = (completed.stderr or "").strip() or f"{exited} {completed.returncode}"
+        return _envelope("local_failed" if local else "ssh_failed", f"{detail}. {hint}")
     if not stdout:
         return _envelope("bad_response", "the runner returned nothing on stdout")
     try:

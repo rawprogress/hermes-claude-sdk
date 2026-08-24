@@ -1,8 +1,9 @@
 """hermes-claude-sdk — drive Claude Code on the Mac from Hermes Agent.
 
 Hermes orchestrates; Claude does the coding, tests, lint, typecheck, build and
-reviews. The plugin owns no state: it forwards JSON over a fixed ssh argv to
-``hermes-claude-runner rpc`` on the Mac, which owns the runs.
+reviews. The plugin owns no state: it forwards JSON over a fixed argv to
+``hermes-claude-runner rpc``, which owns the runs — over ssh by default, or
+directly on this machine when ``transport`` is set to ``local``.
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ _EMOJI = {
     "claude_resume": "▶️",
 }
 
-_SETTING_KEYS = ("ssh_host", "remote_command", "timeout_seconds")
+_SETTING_KEYS = ("transport", "ssh_host", "remote_command", "local_command",
+                 "timeout_seconds")
 
 
 def _read_settings(ctx: Any) -> dict[str, Any]:

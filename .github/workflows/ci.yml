@@ -1,0 +1,56 @@
+# Verification only. This workflow never pushes, tags, releases or publishes:
+# cutting a release is a human decision, described in RELEASE_CHECKLIST.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    # macOS on purpose: the runner is a LaunchAgent, and the doctor's platform
+    # check is required, so a Linux runner would report an honest failure for
+    # a machine the project never claimed to support.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared floor in pyproject, and the newest release. A floor that
+        # nothing tests is a floor nobody supports.
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --all-groups --python ${{ matrix.python-version }}
+
+      - name: Tests
+        # No unit test contacts a model. The three that do are opt-in through
+        # HERMES_CLAUDE_RUNNER_LIVE_SDK and stay skipped here.
+        run: uv run --python ${{ matrix.python-version }} pytest -q
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python-version }} ruff check .
+
+      - name: Types
+        run: uv run --python ${{ matrix.python-version }} mypy

@@ -1,0 +1,51 @@
+[project]
+name = "hermes-claude-runner"
+version = "0.2.0"
+description = "Mac-side runner that lets Hermes Agent drive Claude Code through the official claude-agent-sdk."
+readme = "README.md"
+authors = [{ name = "Katso & rawprogress" }]
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["claude-agent-sdk>=0.2.144"]
+
+[project.scripts]
+hermes-claude-runner = "hermes_claude_runner.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.24,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.14",
+    "mypy>=1.18",
+    "pyyaml>=6.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning:hermes_claude_runner.*"]
+markers = [
+    "integration: needs external binaries (git, hermes); skipped when absent",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+strict_equality = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+ignore_missing_imports = true

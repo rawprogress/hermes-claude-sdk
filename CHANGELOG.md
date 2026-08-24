@@ -65,6 +65,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The installer no longer loses the race between `bootout` and `bootstrap`.** Upgrading a
+  healthy service booted the old one out and bootstrapped the new plist in the next breath,
+  but `bootout` returns when the teardown is *requested*, not when it is done: while the
+  old job still held the label, launchd refused the bootstrap with exit 5,
+  `Input/output error`, and the install died with a valid plist, an executable entrypoint
+  and no service. The bootstrap is now its own readiness probe — retried on any non-zero
+  exit, immediately and then after 0.2 s, 0.5 s, 1 s, 2 s, 4 s, 4 s and 4 s: eight attempts
+  and at most 15.7 s of waiting, with nothing added to an install that has nothing to wait
+  for. The bound comes from the machine it was found on, whose slowest teardown released
+  the label only in time for the sixth attempt at 7.7 s; the ladder deliberately runs past
+  that so a slightly slower machine still has attempts in reserve, and stops doubling at
+  4 s because a longer gap postpones the verdict without making a stuck teardown more
+  likely to finish. A bootstrap that never succeeds stays fatal: the exit code and the
+  attempt count are reported on stderr, `kickstart` is skipped rather than piling a derived
+  failure on the real one, `--json` still prints exactly one object, and the installer exits
+  non-zero.
 - **A stop now stops the whole worker process group, not just its pid.** Only the worker
   was signalled, so the Claude CLI it spawned kept running against the run's worktree. The
   group is signalled only when the worker provably leads both it and its session

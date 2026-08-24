@@ -1,6 +1,11 @@
 #!/bin/sh
-# Install the Mac runner: verify, write the wrapper and LaunchAgent, start it.
-# Idempotent, never deletes state. Run from the repository root.
+# Install the Mac runner: verify, provision the managed runtime, write the
+# wrapper and LaunchAgent, start it. Idempotent, never deletes state.
+# Run from the repository root.
+#
+# This checkout is only the *source* of the install. The service runs from a
+# managed runtime under the runner's own data directory, so the checkout can
+# be moved or deleted afterwards without stopping the daemon.
 #
 #   ./scripts/install_runner.sh                 human install
 #   ./scripts/install_runner.sh --dry-run       show what would change, change nothing
@@ -54,7 +59,7 @@ else
     say "==> Skipping verification (--skip-verify)"
 fi
 
-say "==> Writing wrapper and LaunchAgent plist"
+say "==> Provisioning the managed runtime, wrapper and LaunchAgent plist"
 if [ "$DRY_RUN" -eq 1 ]; then
     INSTALL_REPORT="$(uv run hermes-claude-runner install --dry-run --repo-root "$REPO_ROOT")"
 else
@@ -98,10 +103,21 @@ else
         HEALTH='{"ok":false,"error":"daemon_unavailable","detail":"the wrapper produced no answer"}'
         OK=false
     fi
+
+    say "==> Checking the install outlives this checkout"
+    # The installed wrapper must name the managed runtime and nothing in this
+    # tree: a wrapper that points back here stops working the moment the
+    # checkout is moved or deleted. Recorded in the verdict rather than
+    # exited on, so --json still prints exactly one object.
+    if grep -qF "$REPO_ROOT" "$WRAPPER" 2>/dev/null; then
+        say "    the installed wrapper still names $REPO_ROOT"
+        OK=false
+    fi
     [ "$JSON" -eq 1 ] || printf '%s\n' "$HEALTH"
 fi
 
 say "==> Done. Logs: $HOME/Library/Logs/HermesClaudeRunner/"
+[ "$DRY_RUN" -eq 1 ] || say "    The runtime is installed; running it no longer needs this checkout."
 
 if [ "$JSON" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then DRY=true; else DRY=false; fi
